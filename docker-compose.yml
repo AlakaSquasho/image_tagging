@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  image-tagging-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: image_tagging_bot
+    
+    # 环境变量配置
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - ALLOWED_USER_ID=${ALLOWED_USER_ID}
+      - IMAGE_DOWNLOAD_PATH=/app/downloads
+      - DB_PATH=/app/data/image_index.db
+      - LOG_FILE_PATH=/app/logs/bot.log
+      - OCR_SCHEDULED_TIME=01:00
+      - OCR_MAX_RETRIES=3
+      - OCR_BATCH_SIZE=10
+    
+    # 或者使用 .env 文件
+    # env_file:
+    #   - .env
+    
+    # 卷挂载（数据持久化）
+    volumes:
+      # 下载的图片存储
+      - ./downloads:/app/downloads
+      # 数据库文件存储
+      - ./data:/app/data
+      # 日志文件存储
+      - ./logs:/app/logs
+    
+    # 网络配置
+    networks:
+      - image_tagging_network
+    
+    # 重启策略
+    restart: unless-stopped
+    
+    # 资源限制（可选）
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1'
+    #       memory: 2G
+    #     reservations:
+    #       cpus: '0.5'
+    #       memory: 1G
+    
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "com.example.description=Image Tagging Bot"
+    
+    # 健康检查（可选）
+    # healthcheck:
+    #   test: ["CMD", "python", "-c", "import sqlite3; sqlite3.connect('/app/data/image_index.db').cursor().execute('SELECT 1')"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 40s
+
+networks:
+  image_tagging_network:
+    driver: bridge
+
+# 使用说明：
+# 1. 创建 .env 文件并填入 BOT_TOKEN 和 ALLOWED_USER_ID
+# 2. 运行 docker-compose up -d
+# 3. 查看日志：docker-compose logs -f
+# 4. 停止服务：docker-compose down

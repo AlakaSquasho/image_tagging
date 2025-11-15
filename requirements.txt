@@ -1,0 +1,19 @@
+# 核心依赖
+python-telegram-bot[job-queue]>=22.0  # Telegram Bot API 框架（包含 JobQueue）
+Pillow>=9.0.0                         # 图像处理库
+ImageHash>=4.3.0                      # 图像哈希计算
+
+# OCR 依赖
+paddleocr>=3.0.0                      # PaddleOCR 文本识别引擎
+paddlepaddle>=3.0.0                   # PaddlePaddle 深度学习框架
+
+# 网络和异步
+aiohttp>=3.8.0                        # 异步 HTTP 客户端
+
+# 数据处理和科学计算
+numpy>=2.0.0                          # 数值计算库
+opencv-python-headless>=4.8.0         # 计算机视觉库（无 GUI 版本）
+
+# 工具库
+python-dotenv>=1.0.0                  # 环境变量管理
+requests>=2.30.0                      # HTTP 请求库

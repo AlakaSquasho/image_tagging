@@ -1,0 +1,13 @@
+._*
+.DS_Store
+._config.py
+
+# 排除 Markdown 文档文件
+*.md
+README.md
+CHANGELOG.md
+QUICK_START.md
+IMPROVEMENTS.md
+COMPLETION_SUMMARY.md
+OCR_IMPROVEMENT_V2.1.md
+
