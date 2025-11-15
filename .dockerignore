@@ -1,13 +1,46 @@
-._*
+# Git 相关文件
+.git
+.gitignore
+.gitattributes
+
+# IDE 和编辑器
+.vscode
+.idea
+*.swp
+*.swo
+*~
 .DS_Store
-._config.py
+._*
 
-# 排除 Markdown 文档文件
+# Python 相关
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.pytest_cache
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 环境和配置
+.env
+.env.local
+.env.*.local
+
+# 日志和数据
+*.log
+bot.log
+
+# 文档（仅保留 README.md）
 *.md
-README.md
-CHANGELOG.md
-QUICK_START.md
-IMPROVEMENTS.md
-COMPLETION_SUMMARY.md
-OCR_IMPROVEMENT_V2.1.md
+!README.md
 
+# 其他
+.github
+*.md~
+*.bak
