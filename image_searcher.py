@@ -8,6 +8,7 @@ import logging
 from PIL import Image
 import imagehash
 import jieba
+import opencc
 
 from paddleocr import PaddleOCR
 
@@ -37,6 +38,14 @@ class ImageSimilaritySearcher:
             self.logger.info("Jieba Chinese tokenizer initialized.")
         except Exception as e:
             self.logger.warning(f"Failed to initialize Jieba: {e}. Chinese text segmentation may not work optimally.")
+        
+        # 初始化简繁转换器
+        try:
+            self.cc_s2t = opencc.OpenCC('s2t')  # 简体转繁体
+            self.cc_t2s = opencc.OpenCC('t2s')  # 繁体转简体
+            self.logger.info("OpenCC simplified-traditional Chinese converters initialized.")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize OpenCC: {e}. Simplified-traditional conversion may not work.")
 
     def _init_database(self):
         """初始化数据库"""
@@ -157,6 +166,39 @@ class ImageSimilaritySearcher:
         except Exception as e:
             self.logger.warning(f"Tokenization failed: {e}, returning empty list")
             return []
+
+    def _get_all_variants(self, keywords: List[str]) -> List[str]:
+        """
+        获取关键词的所有变体（简体和繁体）。
+        如果输入是简体，生成繁体版本；如果是繁体，生成简体版本。
+        同时保留原文本，实现双向搜索。
+        
+        例：输入 ['搜索', '文本'] 会返回 ['搜索', '文本', '搜索', '文本']
+        """
+        if not hasattr(self, 'cc_s2t') or not hasattr(self, 'cc_t2s'):
+            return keywords
+        
+        try:
+            all_variants = []
+            for keyword in keywords:
+                all_variants.append(keyword)  # 保留原文本
+                try:
+                    # 转换为繁体，再转换回简体，如果有变化说明是简体，生成繁体
+                    simplified = self.cc_t2s.convert(keyword)
+                    traditional = self.cc_s2t.convert(keyword)
+                    
+                    # 添加转换后的版本（避免重复）
+                    if traditional != keyword and traditional not in all_variants:
+                        all_variants.append(traditional)
+                    if simplified != keyword and simplified not in all_variants:
+                        all_variants.append(simplified)
+                except Exception as e:
+                    self.logger.debug(f"Failed to convert '{keyword}': {e}")
+            
+            return all_variants
+        except Exception as e:
+            self.logger.warning(f"Failed to get variants: {e}, returning original keywords")
+            return keywords
 
     def _extract_features(self, image_path: str, ocr_needed: bool = False) -> Optional[Dict]:
         """
@@ -379,8 +421,8 @@ class ImageSimilaritySearcher:
 
     def search_by_text(self, keywords: str, max_results: int = 3) -> List[Dict]:
         """
-        根据关键字搜索，支持模糊匹配和分词。
-        使用 jieba 对查询关键字进行分词，提高中文搜索准确性。
+        根据关键字搜索，支持模糊匹配、分词和简繁互转。
+        使用 jieba 对查询关键字进行分词，支持简体和繁体互查。
         返回包含文件路径和消息ID的字典列表。
         """
         cursor = self.conn.cursor()
@@ -389,9 +431,12 @@ class ImageSimilaritySearcher:
             query_tokens = self._tokenize_text(keywords)
             
             if query_tokens:
+                # 获取所有变体（简体和繁体）
+                all_variants = self._get_all_variants(query_tokens)
+                
                 # 构建 FTS5 查询：使用 OR 逻辑（任何一个词匹配即可）
-                # 格式: "token1 OR token2 OR token3"
-                fts_query = ' OR '.join(query_tokens)
+                # 格式: "token1 OR token2 OR token3 OR ..."
+                fts_query = ' OR '.join(all_variants)
                 
                 try:
                     # 尝试使用 FTS5 进行全文搜索
@@ -404,16 +449,16 @@ class ImageSimilaritySearcher:
                     results = [{'path': row[0], 'telegram_message_id': row[1]} for row in cursor.fetchall()]
                     
                     if results:
-                        self.logger.info(f"FTS5 search for '{keywords}' found {len(results)} results")
+                        self.logger.info(f"FTS5 search for '{keywords}' found {len(results)} results using {len(all_variants)} variants")
                         return results
                 except sqlite3.OperationalError as e:
                     self.logger.debug(f"FTS5 search failed: {e}, falling back to LIKE search")
                 
-                # 回退方案：使用 LIKE 进行多关键词模糊匹配
+                # 回退方案：使用 LIKE 进行多关键词模糊匹配（包含所有变体）
                 # 构建 LIKE 查询：ANY 条件满足就返回
-                where_clauses = [f"ocr_text LIKE ?" for _ in query_tokens]
+                where_clauses = [f"ocr_text LIKE ?" for _ in all_variants]
                 where_sql = ' OR '.join(where_clauses)
-                query_params = [f"%{token}%" for token in query_tokens] + [max_results]
+                query_params = [f"%{variant}%" for variant in all_variants] + [max_results]
                 
                 cursor.execute(f'''
                     SELECT file_path, telegram_message_id FROM image_features 
@@ -422,7 +467,7 @@ class ImageSimilaritySearcher:
                 ''', query_params)
                 
                 results = [{'path': row[0], 'telegram_message_id': row[1]} for row in cursor.fetchall()]
-                self.logger.info(f"LIKE search for '{keywords}' found {len(results)} results")
+                self.logger.info(f"LIKE search for '{keywords}' found {len(results)} results using {len(all_variants)} variants")
                 return results
             else:
                 # 如果分词失败或关键字为空，使用原始关键字进行搜索

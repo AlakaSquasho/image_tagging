@@ -18,3 +18,4 @@ opencv-python-headless>=4.8.0         # 计算机视觉库（无 GUI 版本）
 python-dotenv>=1.0.0                  # 环境变量管理
 requests>=2.30.0                      # HTTP 请求库
 jieba>=0.42.1                         # 中文分词库
+opencc-python-reimplemented>=0.1.7    # 简繁中文转换库
