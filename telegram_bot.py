@@ -31,6 +31,25 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 
+def create_progress_bar(current: int, total: int, bar_length: int = 20) -> str:
+    """
+    创建 ASCII 进度条。
+    :param current: 当前进度
+    :param total: 总数
+    :param bar_length: 进度条长度（默认20个字符）
+    :return: 进度条字符串
+    """
+    if total == 0:
+        return "■" * bar_length + " 0%"
+    
+    percentage = current / total
+    filled = int(bar_length * percentage)
+    bar = "█" * filled + "░" * (bar_length - filled)
+    percent_str = f"{percentage * 100:.1f}%"
+    
+    return f"{bar} {percent_str}"
+
+
 # --- 初始化搜索器和下载路径 ---
 searcher = ImageSimilaritySearcher(db_path=DB_PATH)
 os.makedirs(IMAGE_DOWNLOAD_PATH, exist_ok=True)
@@ -505,14 +524,19 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("没有待处理的OCR图片。")
         return
     
-    await update.message.reply_text(f"开始处理 {pending_count} 张待OCR的图片，请稍候...\n\n"
-                                    f"处理速度：约 {pending_count // 2}-{pending_count} 秒（取决于图片质量）")
+    # 发送初始状态消息
+    status_message = await update.message.reply_text(
+        f"⏳ 开始处理 {pending_count} 张待OCR的图片\n\n"
+        f"{create_progress_bar(0, pending_count)}\n"
+        f"0/{pending_count} 张已处理"
+    )
     
     try:
-        # 关键改进：循环处理所有待处理图片，直到完成
+        # 关键改进：循环处理所有待处理图片，直到完成，并实时更新进度条
         total_stats = {'processed': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0}
         iteration = 0
         max_iterations = 100  # 防止无限循环的安全阈值
+        last_update_time = datetime.now()  # 记录上次更新时间，避免过于频繁的 API 调用
         
         while iteration < max_iterations:
             iteration += 1
@@ -530,6 +554,24 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_stats['failed'] += stats['failed']
             total_stats['skipped'] += stats['skipped']
             
+            # 每处理完一批后，更新进度条（为避免 API 限流，只在有意义的进度时更新，最多每 0.5 秒更新一次）
+            now = datetime.now()
+            if (now - last_update_time).total_seconds() >= 0.5 or remaining == 0:
+                try:
+                    progress_text = (
+                        f"⏳ 正在处理 {pending_count} 张待OCR的图片\n\n"
+                        f"{create_progress_bar(total_stats['processed'], pending_count)}\n"
+                        f"{total_stats['processed']}/{pending_count} 张已处理"
+                    )
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=status_message.message_id,
+                        text=progress_text
+                    )
+                    last_update_time = now
+                except Exception as e:
+                    logger.debug(f"Failed to update progress message: {e}")
+            
             # 如果本轮没有处理任何图片，说明都是失败的，避免无限循环
             if stats['processed'] == 0:
                 logger.warning(f"No images were processed in iteration {iteration}, stopping.")
@@ -538,8 +580,9 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 构建详细的反馈消息
         message = (
             f"✅ OCR处理完成！\n\n"
+            f"{create_progress_bar(total_stats['processed'], pending_count)}\n"
+            f"总计：{total_stats['processed']}/{pending_count} 张处理\n\n"
             f"📊 处理统计:\n"
-            f"  总处理数: {total_stats['processed']}\n"
             f"  成功: {total_stats['succeeded']}\n"
             f"  失败: {total_stats['failed']}\n"
             f"  跳过: {total_stats['skipped']}\n"
@@ -565,12 +608,24 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"使用 /search 关键词 即可搜索"
             )
         
-        await update.message.reply_text(message)
+        # 更新最终消息
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_message.message_id,
+            text=message
+        )
         logger.info(f"Force OCR completed: {total_stats}, iterations: {iteration}")
     except Exception as e:
         logger.error(f"Error during force OCR: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ OCR处理出现错误: {str(e)}\n\n"
-                                       f"请检查日志文件或重试。")
+        error_message = f"❌ OCR处理出现错误: {str(e)}\n\n请检查日志文件或重试。"
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id,
+                text=error_message
+            )
+        except:
+            await update.message.reply_text(error_message)
 
 
 async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
