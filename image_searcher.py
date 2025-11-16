@@ -7,6 +7,7 @@ import logging
 
 from PIL import Image
 import imagehash
+import jieba
 
 from paddleocr import PaddleOCR
 
@@ -29,6 +30,13 @@ class ImageSimilaritySearcher:
         except Exception as e:
             self.logger.error(f"Failed to initialize PaddleOCR: {e}")
             self.ocr_engine = None
+        
+        # 初始化中文分词器
+        try:
+            jieba.initialize()
+            self.logger.info("Jieba Chinese tokenizer initialized.")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize Jieba: {e}. Chinese text segmentation may not work optimally.")
 
     def _init_database(self):
         """初始化数据库"""
@@ -131,6 +139,24 @@ class ImageSimilaritySearcher:
         except Exception as e:
             self.logger.error(f"OCR failed for {image_path}: {e}")
             return ""
+
+    def _tokenize_text(self, text: str) -> List[str]:
+        """
+        使用 jieba 对中文文本进行分词，同时保留英文单词。
+        返回分词后的关键词列表，并去除长度过短的词汇。
+        """
+        try:
+            if not text or not isinstance(text, str):
+                return []
+            
+            # 使用 jieba 进行分词
+            tokens = jieba.cut(text.strip())
+            # 过滤：移除长度 < 2 的词汇，这些通常是无意义的字符
+            keywords = [token for token in tokens if len(token.strip()) >= 2 and token.strip()]
+            return keywords
+        except Exception as e:
+            self.logger.warning(f"Tokenization failed: {e}, returning empty list")
+            return []
 
     def _extract_features(self, image_path: str, ocr_needed: bool = False) -> Optional[Dict]:
         """
@@ -352,29 +378,61 @@ class ImageSimilaritySearcher:
             return []
 
     def search_by_text(self, keywords: str, max_results: int = 3) -> List[Dict]:
-        """根据关键字搜索，返回包含文件路径和消息ID的字典列表"""
+        """
+        根据关键字搜索，支持模糊匹配和分词。
+        使用 jieba 对查询关键字进行分词，提高中文搜索准确性。
+        返回包含文件路径和消息ID的字典列表。
+        """
         cursor = self.conn.cursor()
         try:
-            # Use FTS5 for full-text search, with BM25 ranking
-            cursor.execute('''
-                SELECT f.file_path, f.telegram_message_id, bm25(image_text_search) as score
-                FROM image_text_search
-                JOIN image_features f ON image_text_search.rowid = f.id
-                WHERE image_text_search MATCH ? ORDER BY score DESC LIMIT ?
-            ''', (keywords, max_results))
-            return [{'path': row[0], 'telegram_message_id': row[1]} for row in cursor.fetchall()]
-        except sqlite3.OperationalError as e:
-            self.logger.error(f"FTS5 search failed, falling back to LIKE: {e}")
-            try:
-                # Fallback to LIKE if FTS table is not available or query fails
+            # 对输入关键字进行分词
+            query_tokens = self._tokenize_text(keywords)
+            
+            if query_tokens:
+                # 构建 FTS5 查询：使用 OR 逻辑（任何一个词匹配即可）
+                # 格式: "token1 OR token2 OR token3"
+                fts_query = ' OR '.join(query_tokens)
+                
+                try:
+                    # 尝试使用 FTS5 进行全文搜索
+                    cursor.execute('''
+                        SELECT f.file_path, f.telegram_message_id, bm25(image_text_search) as score
+                        FROM image_text_search
+                        JOIN image_features f ON image_text_search.rowid = f.id
+                        WHERE image_text_search MATCH ? ORDER BY score DESC LIMIT ?
+                    ''', (fts_query, max_results))
+                    results = [{'path': row[0], 'telegram_message_id': row[1]} for row in cursor.fetchall()]
+                    
+                    if results:
+                        self.logger.info(f"FTS5 search for '{keywords}' found {len(results)} results")
+                        return results
+                except sqlite3.OperationalError as e:
+                    self.logger.debug(f"FTS5 search failed: {e}, falling back to LIKE search")
+                
+                # 回退方案：使用 LIKE 进行多关键词模糊匹配
+                # 构建 LIKE 查询：ANY 条件满足就返回
+                where_clauses = [f"ocr_text LIKE ?" for _ in query_tokens]
+                where_sql = ' OR '.join(where_clauses)
+                query_params = [f"%{token}%" for token in query_tokens] + [max_results]
+                
+                cursor.execute(f'''
+                    SELECT file_path, telegram_message_id FROM image_features 
+                    WHERE {where_sql}
+                    ORDER BY updated_time DESC LIMIT ?
+                ''', query_params)
+                
+                results = [{'path': row[0], 'telegram_message_id': row[1]} for row in cursor.fetchall()]
+                self.logger.info(f"LIKE search for '{keywords}' found {len(results)} results")
+                return results
+            else:
+                # 如果分词失败或关键字为空，使用原始关键字进行搜索
+                self.logger.debug(f"No tokens extracted from '{keywords}', using raw keyword")
                 cursor.execute('''
                     SELECT file_path, telegram_message_id FROM image_features 
                     WHERE ocr_text LIKE ? ORDER BY updated_time DESC LIMIT ?
                 ''', (f'%{keywords}%', max_results))
+                
                 return [{'path': row[0], 'telegram_message_id': row[1]} for row in cursor.fetchall()]
-            except Exception as fallback_e:
-                self.logger.error(f"Fallback search also failed: {fallback_e}")
-                return []
         except Exception as e:
             self.logger.error(f"Error during text search: {e}")
             return []

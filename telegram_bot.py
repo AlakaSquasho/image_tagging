@@ -454,9 +454,10 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if result.get('telegram_message_id'):
                     message = f"找到1个文本匹配结果，原消息ID：{result['telegram_message_id']}"
                 else:
-                    message = f"找到1个文本匹配结果，文件路径：`{os.path.basename(result['path'])}`"
+                    filename = os.path.basename(result['path'])
+                    message = f"找到1个文本匹配结果，文件路径：<code>{filename}</code>"
                 
-                await update.message.reply_text(message, reply_to_message_id=update.message.message_id, parse_mode='Markdown')
+                await update.message.reply_text(message, reply_to_message_id=update.message.message_id, parse_mode='HTML')
             else:
                 # 当有多个结果时，先回复总数，再合并所有结果到一条消息
                 await update.message.reply_text(f"找到 {len(results)} 个文本匹配结果:", reply_to_message_id=update.message.message_id)
@@ -466,13 +467,14 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if result.get('telegram_message_id'):
                         result_messages.append(f"{idx}. 原消息ID：{result['telegram_message_id']}")
                     else:
-                        result_messages.append(f"{idx}. 文件路径：`{os.path.basename(result['path'])}`")
+                        filename = os.path.basename(result['path'])
+                        result_messages.append(f"{idx}. 文件路径：<code>{filename}</code>")
                 
-                combined_message = "\n".join(result_messages)
+                combined_message = "<br>".join(result_messages)
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text=combined_message,
-                    parse_mode='Markdown',
+                    parse_mode='HTML',
                     reply_to_message_id=update.message.message_id
                 )
         except Exception as e:
@@ -481,8 +483,10 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Invalid usage of /search command
     else:
-        await update.message.reply_text("使用方法:\n1. `/search <关键词>` (文本搜索)\n2. 回复一张图片并发送 `/search` (图片搜索)",
-                                        parse_mode='Markdown', reply_to_message_id=update.message.message_id)
+        help_text = """使用方法：
+1. <code>/search &lt;关键词&gt;</code> (文本搜索)
+2. 回复一张图片并发送 <code>/search</code> (图片搜索)"""
+        await update.message.reply_text(help_text, parse_mode='HTML', reply_to_message_id=update.message.message_id)
 
 
 async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
