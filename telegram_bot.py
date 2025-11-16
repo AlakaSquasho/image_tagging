@@ -489,7 +489,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         filename = os.path.basename(result['path'])
                         result_messages.append(f"{idx}. 文件路径：<code>{filename}</code>")
                 
-                combined_message = "<br>".join(result_messages)
+                combined_message = "\n".join(result_messages)
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text=combined_message,
