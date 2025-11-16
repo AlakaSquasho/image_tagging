@@ -536,7 +536,8 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_stats = {'processed': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0}
         iteration = 0
         max_iterations = 100  # 防止无限循环的安全阈值
-        last_update_time = datetime.now()  # 记录上次更新时间，避免过于频繁的 API 调用
+        start_time = datetime.now()  # 记录开始时间，用于计算总耗时
+        last_update_time = start_time  # 记录上次更新时间，避免过于频繁的 API 调用
         
         while iteration < max_iterations:
             iteration += 1
@@ -558,10 +559,15 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             now = datetime.now()
             if (now - last_update_time).total_seconds() >= 0.5 or remaining == 0:
                 try:
+                    # 计算当前耗时
+                    elapsed = now - start_time
+                    elapsed_str = f"{int(elapsed.total_seconds())}s"
+                    
                     progress_text = (
                         f"⏳ 正在处理 {pending_count} 张待OCR的图片\n\n"
                         f"{create_progress_bar(total_stats['processed'], pending_count)}\n"
-                        f"{total_stats['processed']}/{pending_count} 张已处理"
+                        f"{total_stats['processed']}/{pending_count} 张已处理\n\n"
+                        f"⏱️ 已用时: {elapsed_str}"
                     )
                     await context.bot.edit_message_text(
                         chat_id=update.effective_chat.id,
@@ -577,6 +583,13 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"No images were processed in iteration {iteration}, stopping.")
                 break
         
+        # 计算总耗时
+        end_time = datetime.now()
+        total_elapsed = end_time - start_time
+        elapsed_minutes = int(total_elapsed.total_seconds() // 60)
+        elapsed_seconds = int(total_elapsed.total_seconds() % 60)
+        total_time_str = f"{elapsed_minutes}m {elapsed_seconds}s" if elapsed_minutes > 0 else f"{elapsed_seconds}s"
+        
         # 构建详细的反馈消息
         message = (
             f"✅ OCR处理完成！\n\n"
@@ -586,7 +599,8 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  成功: {total_stats['succeeded']}\n"
             f"  失败: {total_stats['failed']}\n"
             f"  跳过: {total_stats['skipped']}\n"
-            f"  迭代次数: {iteration}"
+            f"  迭代次数: {iteration}\n\n"
+            f"⏱️ 总耗时: {total_time_str}"
         )
         
         # 添加失败处理说明
