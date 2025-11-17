@@ -642,6 +642,237 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(error_message)
 
 
+async def setocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    处理 /setocr 命令，手动设置OCR结果。
+    命令用法：回复一张图片并发送 "/setocr 文本内容"
+    例如：/setocr 猫 薛条 可爱
+    """
+    if update.message.from_user.id != ALLOWED_USER_ID:
+        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /setocr.")
+        return
+    
+    # 检查是否回复了一个消息
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "请回复一个包含图片的消息并使用 /setocr 命令。\n\n"
+            "用法：回复图片后发送 `/setocr 文本内容`",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 检查回复的消息是否包含图片
+    replied_message = update.message.reply_to_message
+    if not replied_message.photo:
+        await update.message.reply_text(
+            "请回复一个包含图片的消息。",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 获取OCR文本内容
+    if not context.args:
+        await update.message.reply_text(
+            "请提供OCR文本内容。\n\n"
+            "用法：`/setocr 文本内容`",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 连接所有参数作为OCR文本
+    ocr_text = " ".join(context.args)
+    
+    try:
+        # 获取回复消息的Telegram消息ID
+        replied_message_id = replied_message.message_id
+        
+        # 构造数据库中的telegram_message_id
+        # 需要查找数据库中相应的记录，可能需要通过图片特征查找
+        
+        # 首先下载图片并获取其特征
+        photo = replied_message.photo[-1]
+        file_ext = os.path.splitext(photo.file_unique_id)[1] or '.jpg'
+        temp_file_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"temp_setocr_{uuid4()}{file_ext}")
+        
+        try:
+            if not os.path.exists(IMAGE_DOWNLOAD_PATH):
+                os.makedirs(IMAGE_DOWNLOAD_PATH, exist_ok=True)
+            
+            file = await context.bot.get_file(photo.file_id)
+            await file.download_to_drive(temp_file_path)
+            
+            if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) == 0:
+                logger.error(f"Downloaded file is empty or doesn't exist: {temp_file_path}")
+                await update.message.reply_text(
+                    "下载图片失败，无法设置OCR。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 通过图片特征查找数据库中的记录
+            similar_results = searcher.search_similar_images(temp_file_path, threshold=0, max_results=1)
+            
+            if not similar_results or similar_results[0].get('similarity') != 1.0:
+                await update.message.reply_text(
+                    "未在数据库中找到该图片的记录。\n\n"
+                    "请确认该图片已经被索引。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 获取图片的telegram_message_id
+            image_record = similar_results[0]
+            telegram_message_id_in_db = image_record.get('telegram_message_id')
+            
+            if not telegram_message_id_in_db:
+                await update.message.reply_text(
+                    "该图片没有对应的Telegram消息ID，无法设置OCR。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 设置OCR结果
+            success = searcher.set_manual_ocr_result(telegram_message_id_in_db, ocr_text)
+            
+            if success:
+                pending_count = searcher.get_pending_ocr_count()
+                await update.message.reply_text(
+                    f"✅ OCR结果已成功设置。\n\n"
+                    f"OCR内容: `{ocr_text}`\n"
+                    f"当前待处理OCR图片数: {pending_count}",
+                    parse_mode='Markdown',
+                    reply_to_message_id=update.message.message_id
+                )
+                logger.info(f"User manually set OCR result for message_id {telegram_message_id_in_db}: '{ocr_text}'")
+            else:
+                await update.message.reply_text(
+                    "❌ 设置OCR结果失败，请检查日志。",
+                    reply_to_message_id=update.message.message_id
+                )
+        
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                    logger.info(f"Cleaned up temporary file: {temp_file_path}")
+                except OSError as e:
+                    logger.error(f"Failed to clean up temporary file {temp_file_path}: {e}")
+    
+    except Exception as e:
+        logger.error(f"Error in setocr_command: {e}", exc_info=True)
+        await update.message.reply_text(
+            "处理/setocr命令时发生错误，请检查日志。",
+            reply_to_message_id=update.message.message_id
+        )
+
+
+async def clearocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    处理 /clearocr 命令，清除OCR结果。
+    命令用法：回复一张图片并发送 "/clearocr"
+    """
+    if update.message.from_user.id != ALLOWED_USER_ID:
+        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /clearocr.")
+        return
+    
+    # 检查是否回复了一个消息
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "请回复一个包含图片的消息并使用 /clearocr 命令。",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 检查回复的消息是否包含图片
+    replied_message = update.message.reply_to_message
+    if not replied_message.photo:
+        await update.message.reply_text(
+            "请回复一个包含图片的消息。",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    try:
+        # 下载图片并获取其特征
+        photo = replied_message.photo[-1]
+        file_ext = os.path.splitext(photo.file_unique_id)[1] or '.jpg'
+        temp_file_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"temp_clearocr_{uuid4()}{file_ext}")
+        
+        try:
+            if not os.path.exists(IMAGE_DOWNLOAD_PATH):
+                os.makedirs(IMAGE_DOWNLOAD_PATH, exist_ok=True)
+            
+            file = await context.bot.get_file(photo.file_id)
+            await file.download_to_drive(temp_file_path)
+            
+            if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) == 0:
+                logger.error(f"Downloaded file is empty or doesn't exist: {temp_file_path}")
+                await update.message.reply_text(
+                    "下载图片失败，无法清除OCR。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 通过图片特征查找数据库中的记录
+            similar_results = searcher.search_similar_images(temp_file_path, threshold=0, max_results=1)
+            
+            if not similar_results or similar_results[0].get('similarity') != 1.0:
+                await update.message.reply_text(
+                    "未在数据库中找到该图片的记录。\n\n"
+                    "请确认该图片已经被索引。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 获取图片的telegram_message_id
+            image_record = similar_results[0]
+            telegram_message_id_in_db = image_record.get('telegram_message_id')
+            
+            if not telegram_message_id_in_db:
+                await update.message.reply_text(
+                    "该图片没有对应的Telegram消息ID，无法清除OCR。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 清除OCR结果
+            success = searcher.clear_ocr_result(telegram_message_id_in_db)
+            
+            if success:
+                pending_count = searcher.get_pending_ocr_count()
+                await update.message.reply_text(
+                    f"✅ OCR结果已成功清除。\n\n"
+                    f"该图片的OCR状态已重置为pending。\n"
+                    f"当前待处理OCR图片数: {pending_count}",
+                    reply_to_message_id=update.message.message_id
+                )
+                logger.info(f"User manually cleared OCR result for message_id {telegram_message_id_in_db}")
+            else:
+                await update.message.reply_text(
+                    "❌ 清除OCR结果失败，请检查日志。",
+                    reply_to_message_id=update.message.message_id
+                )
+        
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                    logger.info(f"Cleaned up temporary file: {temp_file_path}")
+                except OSError as e:
+                    logger.error(f"Failed to clean up temporary file {temp_file_path}: {e}")
+    
+    except Exception as e:
+        logger.error(f"Error in clearocr_command: {e}", exc_info=True)
+        await update.message.reply_text(
+            "处理/clearocr命令时发生错误，请检查日志。",
+            reply_to_message_id=update.message.message_id
+        )
+
+
 async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
     """
     定时执行OCR任务 - 处理所有待处理的图片
@@ -728,6 +959,8 @@ if __name__ == '__main__':
     # Add handlers
     application.add_handler(CommandHandler('search', search_command))
     application.add_handler(CommandHandler('forceOCR', force_ocr_command))
+    application.add_handler(CommandHandler('setocr', setocr_command))
+    application.add_handler(CommandHandler('clearocr', clearocr_command))
     # handle_photo processes all photo messages, internal logic decides add or search
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     

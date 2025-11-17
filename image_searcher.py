@@ -357,6 +357,97 @@ class ImageSimilaritySearcher:
             self.logger.error(f"Failed to get pending OCR count: {e}")
             return 0
 
+    def set_manual_ocr_result(self, telegram_message_id: str, ocr_text: str) -> bool:
+        """
+        手动设置指定消息ID的图片的OCR结果。
+        将OCR文本设置为指定内容，状态修改为'processed'，失败计数重置为0。
+        
+        Args:
+            telegram_message_id: Telegram消息ID
+            ocr_text: 要设置的OCR文本内容
+            
+        Returns:
+            bool: 成功返回True，失败返回False
+        """
+        if not telegram_message_id or not isinstance(ocr_text, str):
+            self.logger.warning("Invalid parameters for set_manual_ocr_result")
+            return False
+        
+        cursor = self.conn.cursor()
+        try:
+            # 查找对应的图片记录
+            cursor.execute(
+                "SELECT id, file_path FROM image_features WHERE telegram_message_id = ?",
+                (telegram_message_id,)
+            )
+            result = cursor.fetchone()
+            
+            if not result:
+                self.logger.warning(f"No image found with telegram_message_id: {telegram_message_id}")
+                return False
+            
+            img_id, file_path = result
+            
+            # 更新OCR结果
+            cursor.execute(
+                "UPDATE image_features SET ocr_text = ?, ocr_status = 'completed', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
+                (ocr_text, time.time(), img_id)
+            )
+            self.conn.commit()
+            
+            self.logger.info(f"Manually set OCR result for {file_path} (message_id: {telegram_message_id}): '{ocr_text}'")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to set manual OCR result for message_id {telegram_message_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def clear_ocr_result(self, telegram_message_id: str) -> bool:
+        """
+        清除指定消息ID的图片的OCR结果。
+        将OCR文本清空，状态修改为'pending'，失败计数重置为0。
+        
+        Args:
+            telegram_message_id: Telegram消息ID
+            
+        Returns:
+            bool: 成功返回True，失败返回False
+        """
+        if not telegram_message_id:
+            self.logger.warning("Invalid telegram_message_id for clear_ocr_result")
+            return False
+        
+        cursor = self.conn.cursor()
+        try:
+            # 查找对应的图片记录
+            cursor.execute(
+                "SELECT id, file_path FROM image_features WHERE telegram_message_id = ?",
+                (telegram_message_id,)
+            )
+            result = cursor.fetchone()
+            
+            if not result:
+                self.logger.warning(f"No image found with telegram_message_id: {telegram_message_id}")
+                return False
+            
+            img_id, file_path = result
+            
+            # 清除OCR结果并重置状态
+            cursor.execute(
+                "UPDATE image_features SET ocr_text = '', ocr_status = 'pending', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
+                (time.time(), img_id)
+            )
+            self.conn.commit()
+            
+            self.logger.info(f"Cleared OCR result for {file_path} (message_id: {telegram_message_id})")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to clear OCR result for message_id {telegram_message_id}: {e}")
+            self.conn.rollback()
+            return False
+
     def _hamming_distance(self, hash1: str, hash2: str) -> int:
         """计算两个哈希字符串之间的汉明距离"""
         # Ensure hashes are of the same length, phash is typically 64-bit (16 hex chars)
