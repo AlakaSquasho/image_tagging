@@ -6,6 +6,15 @@ from uuid import uuid4
 from datetime import datetime, time
 import asyncio
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Python < 3.9 fallback
+    try:
+        from backports.zoneinfo import ZoneInfo
+    except ImportError:
+        ZoneInfo = None
+
 from telegram import Update, InputFile, MessageOriginChannel
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
@@ -188,17 +197,18 @@ async def check_and_archive_images(download_folder: str, max_count: int, searche
         logger.info(f"Image count ({len(image_files)}) is below {max_count}. No archive needed.")
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_photo_with_retry(update: Update, context: ContextTypes.DEFAULT_TYPE, max_retries: int = OCR_MAX_RETRIES) -> bool:
     """
-    处理用户发送的图片。
-    - 如果图片附带 /search 命令，则执行搜索。
-    - 否则，检查图片是否已存在。若不存在，则添加索引；若存在，则根据是否有原消息ID返回相应结果。
+    带重试机制的图片处理函数。
+    
+    Args:
+        update: Telegram Update对象
+        context: Telegram Context对象
+        max_retries: 最大重试次数，默认使用OCR配置的重试次数
+        
+    Returns:
+        bool: 处理成功返回True，失败返回False
     """
-    if update.message.from_user.id != ALLOWED_USER_ID:
-        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact.")
-        return
-
-    await update.message.reply_text("处理中...")
     photo = update.message.photo[-1] # Get the largest photo size
     current_message_id = update.message.message_id # Bot's received message ID
     
@@ -219,98 +229,141 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_ext = os.path.splitext(photo.file_unique_id)[1] or '.jpg'
     temp_save_path = None
     
-    try:
-        # 生成临时文件路径，确保文件夹存在
-        if not os.path.exists(IMAGE_DOWNLOAD_PATH):
-            os.makedirs(IMAGE_DOWNLOAD_PATH, exist_ok=True)
-        
-        temp_save_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"temp_{uuid4()}{file_ext}")
-        
-        # 下载文件
-        file = await context.bot.get_file(photo.file_id)
-        await file.download_to_drive(temp_save_path)
-        
-        # 验证文件是否成功下载
-        if not os.path.exists(temp_save_path) or os.path.getsize(temp_save_path) == 0:
-            logger.error(f"Downloaded file is empty or doesn't exist: {temp_save_path}")
-            await update.message.reply_text("下载文件失败，文件为空。", reply_to_message_id=current_message_id)
-            return
-        
-        logger.info(f"Downloaded photo to temporary path {temp_save_path}")
-
-        # Check if the message caption contains the /search command
-        if update.message.caption and update.message.caption.strip().lower() == '/search':
-            # --- Execute search logic ---
-            await search_by_image(update, context, temp_save_path)
-        else:
-            # --- Execute add/deduplication logic ---
-            # 1. Check for exact duplicate first
-            exact_match_results = searcher.search_similar_images(temp_save_path, threshold=0, max_results=1)
+    for attempt in range(max_retries + 1):  # +1 因为第一次不算重试
+        try:
+            # 生成临时文件路径，确保文件夹存在
+            if not os.path.exists(IMAGE_DOWNLOAD_PATH):
+                os.makedirs(IMAGE_DOWNLOAD_PATH, exist_ok=True)
             
-            if exact_match_results and exact_match_results[0].get('similarity') == 1.0:
-                exact_match_data = exact_match_results[0]
-                existing_telegram_message_id_in_db = exact_match_data.get('telegram_message_id')
-                
-                if existing_telegram_message_id_in_db:
-                    await update.message.reply_text(f"此图片已存在。\n原消息ID: {existing_telegram_message_id_in_db}", reply_to_message_id=current_message_id)
-                    logger.info(f"Duplicate image received, original telegram_message_id: {existing_telegram_message_id_in_db}")
-                else:
-                    try:
-                        with open(exact_match_data['path'], 'rb') as photo_file:
-                            caption = (f"此图片已存在，但无原消息ID。\n"
-                                       f"文件路径: `{os.path.basename(exact_match_data['path'])}`\n"
-                                       f"文件哈希: `{exact_match_data['file_hash']}`\n"
-                                       f"更新时间: {datetime.fromtimestamp(exact_match_data['updated_time']).strftime('%Y-%m-%d %H:%M:%S')}")
-                            await context.bot.send_photo(
-                                chat_id=update.effective_chat.id,
-                                photo=InputFile(photo_file),
-                                caption=caption,
-                                parse_mode='Markdown',
-                                reply_to_message_id=current_message_id
-                            )
-                            logger.info(f"Duplicate image received with no source message ID, sent details for {exact_match_data['path']}")
-                    except FileNotFoundError:
-                        logger.warning(f"Existing file not found: {exact_match_data['path']}. Cannot send to user.")
-                        await update.message.reply_text("此图片已存在，但原始文件丢失。", reply_to_message_id=current_message_id)
-                    except Exception as e:
-                        logger.error(f"Error sending existing image details: {e}")
-                        await update.message.reply_text("处理现有图片时发生错误。", reply_to_message_id=current_message_id)
+            temp_save_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"temp_{uuid4()}{file_ext}")
+            
+            # 下载文件
+            file = await context.bot.get_file(photo.file_id)
+            await file.download_to_drive(temp_save_path)
+            
+            # 验证文件是否成功下载
+            if not os.path.exists(temp_save_path) or os.path.getsize(temp_save_path) == 0:
+                raise Exception(f"Downloaded file is empty or doesn't exist: {temp_save_path}")
+            
+            logger.info(f"Downloaded photo to temporary path {temp_save_path} (attempt {attempt + 1})")
+
+            # Check if the message caption contains the /search command
+            if update.message.caption and update.message.caption.strip().lower() == '/search':
+                # --- Execute search logic ---
+                await search_by_image(update, context, temp_save_path)
+                return True
             else:
-                # 2. If it's a new image, rename and add to index
-                permanent_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"{current_message_id}_{photo.file_unique_id}{file_ext}")
+                # --- Execute add/deduplication logic ---
+                # 1. Check for exact duplicate first
+                exact_match_results = searcher.search_similar_images(temp_save_path, threshold=0, max_results=1)
                 
-                try:
-                    os.rename(temp_save_path, permanent_path)
-                    temp_save_path = None  # Mark as None to prevent deletion in finally block
-                except OSError as e:
-                    logger.error(f"Failed to rename file {temp_save_path} to {permanent_path}: {e}")
-                    await update.message.reply_text("重命名文件失败，请检查日志。", reply_to_message_id=current_message_id)
-                    return
-
-                # Add image to index - now returns bool (True/False) instead of OCR text
-                # OCR will be processed later by scheduled task
-                index_success = searcher.add_image_to_index(permanent_path, telegram_msg_id_for_db)
-                if index_success:
-                    pending_count = searcher.get_pending_ocr_count()
-                    await update.message.reply_text(f"该图片已成功建立索引。\nOCR处理将在定时任务中进行。\n当前待处理OCR图片数: {pending_count}", 
-                                                    reply_to_message_id=current_message_id, parse_mode='Markdown')
+                if exact_match_results and exact_match_results[0].get('similarity') == 1.0:
+                    exact_match_data = exact_match_results[0]
+                    existing_telegram_message_id_in_db = exact_match_data.get('telegram_message_id')
+                    
+                    if existing_telegram_message_id_in_db:
+                        await update.message.reply_text(f"此图片已存在。\n原消息ID: {existing_telegram_message_id_in_db}", reply_to_message_id=current_message_id)
+                        logger.info(f"Duplicate image received, original telegram_message_id: {existing_telegram_message_id_in_db}")
+                    else:
+                        try:
+                            with open(exact_match_data['path'], 'rb') as photo_file:
+                                caption = (f"此图片已存在，但无原消息ID。\n"
+                                           f"文件路径: `{os.path.basename(exact_match_data['path'])}`\n"
+                                           f"文件哈希: `{exact_match_data['file_hash']}`\n"
+                                           f"更新时间: {datetime.fromtimestamp(exact_match_data['updated_time']).strftime('%Y-%m-%d %H:%M:%S')}")
+                                await context.bot.send_photo(
+                                    chat_id=update.effective_chat.id,
+                                    photo=InputFile(photo_file),
+                                    caption=caption,
+                                    parse_mode='Markdown',
+                                    reply_to_message_id=current_message_id
+                                )
+                                logger.info(f"Duplicate image received with no source message ID, sent details for {exact_match_data['path']}")
+                        except FileNotFoundError:
+                            logger.warning(f"Existing file not found: {exact_match_data['path']}. Cannot send to user.")
+                            await update.message.reply_text("此图片已存在，但原始文件丢失。", reply_to_message_id=current_message_id)
+                        except Exception as e:
+                            logger.error(f"Error sending existing image details: {e}")
+                            await update.message.reply_text("处理现有图片时发生错误。", reply_to_message_id=current_message_id)
                 else:
-                    await update.message.reply_text("图片索引建立失败，请检查日志。", reply_to_message_id=current_message_id)
-                
-                # After successfully indexing a new image, check for archiving
-                await check_and_archive_images(IMAGE_DOWNLOAD_PATH, MAX_IMAGES_IN_DOWNLOAD_FOLDER, searcher, context)
+                    # 2. If it's a new image, rename and add to index
+                    permanent_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"{current_message_id}_{photo.file_unique_id}{file_ext}")
+                    
+                    try:
+                        os.rename(temp_save_path, permanent_path)
+                        temp_save_path = None  # Mark as None to prevent deletion in finally block
+                    except OSError as e:
+                        raise Exception(f"Failed to rename file {temp_save_path} to {permanent_path}: {e}")
 
-    except Exception as e:
-        logger.error(f"Error handling photo with message_id {current_message_id}: {e}", exc_info=True)
-        await update.message.reply_text("处理图片时发生错误。", reply_to_message_id=current_message_id)
-    finally:
-        # Clean up temporary file if it still exists
-        if temp_save_path and os.path.exists(temp_save_path):
-            try:
-                os.remove(temp_save_path)
-                logger.info(f"Cleaned up temporary file: {temp_save_path}")
-            except OSError as e:
-                logger.error(f"Failed to clean up temporary file {temp_save_path}: {e}")
+                    # Add image to index - now returns bool (True/False) instead of OCR text
+                    # OCR will be processed later by scheduled task
+                    index_success = searcher.add_image_to_index(permanent_path, telegram_msg_id_for_db)
+                    if index_success:
+                        pending_count = searcher.get_pending_ocr_count()
+                        await update.message.reply_text(f"该图片已成功建立索引。\nOCR处理将在定时任务中进行。\n当前待处理OCR图片数: {pending_count}", 
+                                                        reply_to_message_id=current_message_id, parse_mode='Markdown')
+                    else:
+                        raise Exception("图片索引建立失败")
+                    
+                    # After successfully indexing a new image, check for archiving
+                    await check_and_archive_images(IMAGE_DOWNLOAD_PATH, MAX_IMAGES_IN_DOWNLOAD_FOLDER, searcher, context)
+                
+                return True  # 成功处理
+                
+        except Exception as e:
+            logger.error(f"Error handling photo attempt {attempt + 1}/{max_retries + 1} with message_id {current_message_id}: {e}")
+            
+            # 如果还有重试机会，继续重试
+            if attempt < max_retries:
+                logger.info(f"Retrying photo processing... (attempt {attempt + 2}/{max_retries + 1})")
+                # 清理临时文件（如果存在）
+                if temp_save_path and os.path.exists(temp_save_path):
+                    try:
+                        os.remove(temp_save_path)
+                        temp_save_path = None
+                    except OSError:
+                        pass
+                # 短暂延迟后重试
+                await asyncio.sleep(1)
+                continue
+            else:
+                # 已达到最大重试次数，放弃处理
+                logger.error(f"Failed to handle photo after {max_retries + 1} attempts with message_id {current_message_id}")
+                await update.message.reply_text(
+                    f"图片处理失败（已重试{max_retries}次）。\n请检查日志或稍后重试。", 
+                    reply_to_message_id=current_message_id
+                )
+                return False
+        
+        finally:
+            # Clean up temporary file if it still exists
+            if temp_save_path and os.path.exists(temp_save_path):
+                try:
+                    os.remove(temp_save_path)
+                    logger.info(f"Cleaned up temporary file: {temp_save_path}")
+                except OSError as e:
+                    logger.error(f"Failed to clean up temporary file {temp_save_path}: {e}")
+    
+    return False  # 不应该到达这里，但为了安全起见
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    处理用户发送的图片。
+    - 如果图片附带 /search 命令，则执行搜索。
+    - 否则，检查图片是否已存在。若不存在，则添加索引；若存在，则根据是否有原消息ID返回相应结果。
+    
+    现在包含重试机制：如果处理失败，会自动重试，重试次数与OCR配置保持一致。
+    """
+    if update.message.from_user.id != ALLOWED_USER_ID:
+        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact.")
+        return
+
+    await update.message.reply_text("处理中...")
+    
+    # 调用带重试机制的处理函数
+    await handle_photo_with_retry(update, context)
+
 
 
 async def search_by_image(update: Update, context: ContextTypes.DEFAULT_TYPE, query_image_path: str):
@@ -942,10 +995,24 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
 
 
 def parse_scheduled_time(time_str: str) -> Optional[time]:
-    """解析时间字符串 (格式: HH:MM) 为 time 对象"""
+    """
+    解析时间字符串 (格式: HH:MM) 为 time 对象
+    注意：python-telegram-bot 的调度器使用UTC时间，
+    但我们希望使用北京时间(UTC+8)来配置定时任务时间。
+    因此需要将北京时间转换为UTC时间。
+    """
     try:
         hour, minute = map(int, time_str.split(':'))
-        return time(hour=hour, minute=minute)
+        # 创建北京时间的时间对象
+        beijing_time = time(hour=hour, minute=minute)
+        
+        # 将北京时间转换为UTC时间
+        # 北京时间减8小时等于UTC时间
+        utc_hour = (hour - 8) % 24
+        utc_time = time(hour=utc_hour, minute=minute)
+        
+        logger.info(f"Scheduled time converted: Beijing {time_str} -> UTC {utc_time.strftime('%H:%M')}")
+        return utc_time
     except (ValueError, AttributeError):
         logger.error(f"Invalid time format: {time_str}. Expected HH:MM")
         return None
@@ -965,11 +1032,12 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
     # Add scheduled OCR task
+    # 注意：定时任务使用北京时间(UTC+8)配置，实际调度时间会自动转换为UTC
     scheduled_ocr_time = parse_scheduled_time(OCR_SCHEDULED_TIME)
     if scheduled_ocr_time:
         job_queue = application.job_queue
         job_queue.run_daily(scheduled_ocr_task, time=scheduled_ocr_time)
-        logger.info(f"Scheduled daily OCR task at {OCR_SCHEDULED_TIME}")
+        logger.info(f"Scheduled daily OCR task at Beijing time {OCR_SCHEDULED_TIME} (UTC {scheduled_ocr_time.strftime('%H:%M')})")
     else:
         logger.warning(f"Failed to parse OCR scheduled time: {OCR_SCHEDULED_TIME}")
     

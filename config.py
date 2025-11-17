@@ -11,8 +11,10 @@ LOG_FILE_PATH = "bot.log"          # 日志文件路径
 MAX_IMAGES_IN_DOWNLOAD_FOLDER = 300
 
 # -- OCR 配置 --
-OCR_SCHEDULED_TIME = "04:00"  # 每天执行OCR的时间 (格式: HH:MM, 24小时制)
+OCR_SCHEDULED_TIME = "04:00"  # 每天执行OCR的时间 (格式: HH:MM, 24小时制, 北京时间UTC+8)
+                              # 注意：此配置使用北京时间，系统会自动转换为UTC时间进行调度
 OCR_MAX_RETRIES = 3           # OCR失败后最多重试次数
+                              # 注意：此重试次数同时适用于OCR处理和图片处理失败的重试
 OCR_BATCH_SIZE = 5           # 单次处理的最大图片数量（内存优化，不影响总处理数）
                               # 说明：定时任务会循环调用，直到所有待处理图片都完成
                               # 例如：如果有 25 张待处理，会分 3 次处理（10+10+5）
