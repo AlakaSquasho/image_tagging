@@ -18,7 +18,7 @@ except ImportError:
 from telegram import Update, InputFile, MessageOriginChannel
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
-from config import BOT_TOKEN, ALLOWED_USER_ID, IMAGE_DOWNLOAD_PATH, DB_PATH, LOG_FILE_PATH, MAX_IMAGES_IN_DOWNLOAD_FOLDER, OCR_SCHEDULED_TIME, OCR_MAX_RETRIES, OCR_BATCH_SIZE
+from config import BOT_TOKEN, ALLOWED_USER_ID, IMAGE_DOWNLOAD_PATH, DB_PATH, LOG_FILE_PATH, MAX_IMAGES_IN_DOWNLOAD_FOLDER, OCR_SCHEDULED_TIME, OCR_MAX_RETRIES, OCR_BATCH_SIZE, MAX_RESULTS
 from image_searcher import ImageSimilaritySearcher
 
 from typing import Dict, Optional, List
@@ -515,7 +515,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.args:
         try:
             keywords = " ".join(context.args)
-            results = searcher.search_by_text(keywords)
+            results = searcher.search_by_text(keywords, max_results=MAX_RESULTS)
             if not results:
                 await update.message.reply_text("未找到文本匹配结果。", reply_to_message_id=update.message.message_id)
                 return
