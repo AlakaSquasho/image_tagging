@@ -18,7 +18,9 @@ except ImportError:
 from telegram import Update, InputFile, MessageOriginChannel
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
-from config import BOT_TOKEN, ALLOWED_USER_ID, IMAGE_DOWNLOAD_PATH, DB_PATH, LOG_FILE_PATH, MAX_IMAGES_IN_DOWNLOAD_FOLDER, OCR_SCHEDULED_TIME, OCR_MAX_RETRIES, OCR_BATCH_SIZE, MAX_RESULTS
+from config import (BOT_TOKEN, ALLOWED_USER_ID, IMAGE_DOWNLOAD_PATH, DB_PATH, LOG_FILE_PATH, 
+                   MAX_IMAGES_IN_DOWNLOAD_FOLDER, OCR_SCHEDULED_TIME, OCR_MAX_RETRIES, OCR_BATCH_SIZE, 
+                   MAX_RESULTS, SCHEDULER_MISFIRE_GRACE_TIME, SCHEDULER_MAX_INSTANCES, SCHEDULER_COALESCE)
 from image_searcher import ImageSimilaritySearcher
 
 from typing import Dict, Optional, List
@@ -514,25 +516,70 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Mode 2: Search by keywords (text after /search command)
     elif context.args:
         try:
-            keywords = " ".join(context.args)
-            results = searcher.search_by_text(keywords, max_results=MAX_RESULTS)
-            if not results:
-                await update.message.reply_text("未找到文本匹配结果。", reply_to_message_id=update.message.message_id)
+            # 解析搜索模式参数
+            search_mode = 'smart'  # 默认模式
+            keywords_args = context.args
+            
+            # 检查是否有搜索模式参数
+            if len(context.args) > 1 and context.args[0].startswith('--'):
+                mode_param = context.args[0][2:]  # 移除 '--'
+                if mode_param in ['smart', 'comprehensive', 'fts', 'like']:
+                    search_mode = mode_param
+                    keywords_args = context.args[1:]  # 剩余参数作为关键词
+                else:
+                    await update.message.reply_text(
+                        f"无效的搜索模式: {mode_param}\n"
+                        f"支持的模式: --smart, --comprehensive, --fts, --like",
+                        reply_to_message_id=update.message.message_id
+                    )
+                    return
+            
+            keywords = " ".join(keywords_args)
+            if not keywords.strip():
+                await update.message.reply_text(
+                    "请提供搜索关键词。\n\n"
+                    "用法示例：\n"
+                    "• `/search 关键词` (智能模式)\n"
+                    "• `/search --comprehensive 关键词` (全面搜索)\n"
+                    "• `/search --fts 关键词` (仅FTS5)\n"
+                    "• `/search --like 关键词` (仅模糊匹配)",
+                    parse_mode='Markdown',
+                    reply_to_message_id=update.message.message_id
+                )
                 return
+            
+            results = searcher.search_by_text(keywords, max_results=MAX_RESULTS, search_mode=search_mode)
+            if not results:
+                await update.message.reply_text(
+                    f"未找到文本匹配结果 (模式: {search_mode})。", 
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 构建搜索模式说明
+            mode_desc = {
+                'smart': '智能',
+                'comprehensive': '全面', 
+                'fts': 'FTS5',
+                'like': '模糊匹配'
+            }.get(search_mode, search_mode)
             
             # 当只有一个结果时，合并为一句话
             if len(results) == 1:
                 result = results[0]
                 if result.get('telegram_message_id'):
-                    message = f"找到1个文本匹配结果，原消息ID：{result['telegram_message_id']}"
+                    message = f"找到1个文本匹配结果 ({mode_desc}模式)，原消息ID：{result['telegram_message_id']}"
                 else:
                     filename = os.path.basename(result['path'])
-                    message = f"找到1个文本匹配结果，文件路径：<code>{filename}</code>"
+                    message = f"找到1个文本匹配结果 ({mode_desc}模式)，文件路径：<code>{filename}</code>"
                 
                 await update.message.reply_text(message, reply_to_message_id=update.message.message_id, parse_mode='HTML')
             else:
                 # 当有多个结果时，先回复总数，再合并所有结果到一条消息
-                await update.message.reply_text(f"找到 {len(results)} 个文本匹配结果:", reply_to_message_id=update.message.message_id)
+                await update.message.reply_text(
+                    f"找到 {len(results)} 个文本匹配结果 ({mode_desc}模式):", 
+                    reply_to_message_id=update.message.message_id
+                )
                 
                 result_messages = []
                 for idx, result in enumerate(results, 1):
@@ -556,8 +603,11 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Invalid usage of /search command
     else:
         help_text = """使用方法：
-1. <code>/search &lt;关键词&gt;</code> (文本搜索)
-2. 回复一张图片并发送 <code>/search</code> (图片搜索)"""
+1. <code>/search &lt;关键词&gt;</code> (智能模式文本搜索)
+2. <code>/search --comprehensive &lt;关键词&gt;</code> (全面搜索，合并FTS5和模糊匹配结果)
+3. <code>/search --fts &lt;关键词&gt;</code> (仅使用FTS5全文搜索)
+4. <code>/search --like &lt;关键词&gt;</code> (仅使用模糊匹配)
+5. 回复一张图片并发送 <code>/search</code> (图片搜索)"""
         await update.message.reply_text(help_text, parse_mode='HTML', reply_to_message_id=update.message.message_id)
 
 
@@ -933,10 +983,17 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
     为了避免OCR任务积压，本任务会循环调用process_ocr_pending_images，
     直到所有待处理的图片都被处理完成。
     """
+    task_start_time = datetime.now()
+    logger.info(f"Scheduled OCR task started at: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
     try:
         pending_count = searcher.get_pending_ocr_count()
         if pending_count == 0:
             logger.info("Scheduled OCR task: No pending images.")
+            await context.bot.send_message(
+                chat_id=ALLOWED_USER_ID, 
+                text=f"✅ 定时OCR任务完成\n当前无待处理图片\n执行时间: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
             return
         
         logger.info(f"Starting scheduled OCR task for {pending_count} images...")
@@ -968,14 +1025,24 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
             
             logger.info(f"Iteration {iteration} completed: {stats}")
         
+        # 计算任务耗时
+        task_end_time = datetime.now()
+        task_duration = task_end_time - task_start_time
+        duration_str = f"{int(task_duration.total_seconds())}s"
+        
         # 发送完整的统计信息
         message = (
-            f"定时OCR任务已完成\n"
+            f"✅ 定时OCR任务已完成\n\n"
+            f"📊 处理统计:\n"
             f"总处理数: {total_stats['processed']}\n"
             f"成功: {total_stats['succeeded']}\n"
             f"失败: {total_stats['failed']}\n"
             f"跳过: {total_stats['skipped']}\n"
-            f"迭代次数: {iteration}"
+            f"迭代次数: {iteration}\n\n"
+            f"⏱️ 执行信息:\n"
+            f"开始时间: {task_start_time.strftime('%H:%M:%S')}\n"
+            f"结束时间: {task_end_time.strftime('%H:%M:%S')}\n"
+            f"执行耗时: {duration_str}"
         )
         
         if total_stats['failed'] > 0:
@@ -985,11 +1052,23 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
             )
         
         await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=message)
-        logger.info(f"Scheduled OCR task completed: {total_stats}, iterations: {iteration}")
+        logger.info(f"Scheduled OCR task completed successfully: {total_stats}, iterations: {iteration}, duration: {duration_str}")
+        
     except Exception as e:
+        task_duration = datetime.now() - task_start_time
+        duration_str = f"{int(task_duration.total_seconds())}s"
+        
         logger.error(f"Error in scheduled OCR task: {e}", exc_info=True)
+        
         try:
-            await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=f"定时OCR任务出现错误: {str(e)}")
+            error_message = (
+                f"❌ 定时OCR任务出现错误\n\n"
+                f"错误信息: {str(e)}\n"
+                f"执行时间: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"失败耗时: {duration_str}\n\n"
+                f"请检查日志获取详细错误信息。"
+            )
+            await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=error_message)
         except Exception as send_error:
             logger.error(f"Failed to send error message to user: {send_error}")
 
@@ -1031,13 +1110,39 @@ if __name__ == '__main__':
     # handle_photo processes all photo messages, internal logic decides add or search
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
-    # Add scheduled OCR task
+    # Add scheduled OCR task with enhanced configuration
     # 注意：定时任务使用北京时间(UTC+8)配置，实际调度时间会自动转换为UTC
     scheduled_ocr_time = parse_scheduled_time(OCR_SCHEDULED_TIME)
     if scheduled_ocr_time:
         job_queue = application.job_queue
-        job_queue.run_daily(scheduled_ocr_task, time=scheduled_ocr_time)
-        logger.info(f"Scheduled daily OCR task at Beijing time {OCR_SCHEDULED_TIME} (UTC {scheduled_ocr_time.strftime('%H:%M')})")
+        
+        # 配置调度器参数
+        try:
+            # 添加定时任务，带有增强的配置
+            job = job_queue.run_daily(
+                scheduled_ocr_task, 
+                time=scheduled_ocr_time,
+                name="daily_ocr_task",  # 给任务命名
+                job_kwargs={
+                    'misfire_grace_time': SCHEDULER_MISFIRE_GRACE_TIME,  # 延迟容忍时间
+                    'max_instances': SCHEDULER_MAX_INSTANCES,            # 最大并发实例
+                    'coalesce': SCHEDULER_COALESCE                       # 合并延迟任务
+                }
+            )
+            
+            logger.info(f"Scheduled daily OCR task at Beijing time {OCR_SCHEDULED_TIME} (UTC {scheduled_ocr_time.strftime('%H:%M')})")
+            logger.info(f"Task configuration: misfire_grace_time={SCHEDULER_MISFIRE_GRACE_TIME}s, max_instances={SCHEDULER_MAX_INSTANCES}, coalesce={SCHEDULER_COALESCE}")
+            
+            # 记录下一次执行时间
+            next_run = job.next_run_time
+            if next_run:
+                logger.info(f"Next OCR task scheduled for: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            
+        except Exception as e:
+            logger.error(f"Failed to configure scheduled OCR task: {e}")
+            # 回退到简单配置
+            job_queue.run_daily(scheduled_ocr_task, time=scheduled_ocr_time)
+            logger.warning("Using fallback scheduler configuration")
     else:
         logger.warning(f"Failed to parse OCR scheduled time: {OCR_SCHEDULED_TIME}")
     

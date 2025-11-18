@@ -4,6 +4,7 @@ import hashlib
 from typing import List, Dict, Optional, Tuple
 import time
 import logging
+import re
 
 from PIL import Image
 import imagehash
@@ -46,6 +47,35 @@ class ImageSimilaritySearcher:
             self.logger.info("OpenCC simplified-traditional Chinese converters initialized.")
         except Exception as e:
             self.logger.warning(f"Failed to initialize OpenCC: {e}. Simplified-traditional conversion may not work.")
+
+    def _clean_text(self, text: str) -> str:
+        """
+        清理和规范化文本，移除噪声字符。
+        用于OCR结果的标准化处理，提高搜索准确性。
+        """
+        if not text or not isinstance(text, str):
+            return ""
+        
+        # 1. 先移除换行符和制表符，替换为空格
+        text = re.sub(r'[\r\n\t]+', ' ', text)
+        
+        # 2. 移除多余的空白字符
+        text = re.sub(r'\s+', ' ', text.strip())
+        
+        # 3. 移除常见的OCR噪声字符
+        # 移除特殊符号、标点（保留中英文字符、数字）
+        text = re.sub(r'[^\u4e00-\u9fff\w\s]', '', text)
+        
+        # 4. 再次清理空格
+        text = re.sub(r'\s+', ' ', text.strip())
+        
+        return text
+    
+    def _normalize_query_text(self, text: str) -> str:
+        """
+        规范化查询文本，确保与数据库中的清理后文本格式一致。
+        """
+        return self._clean_text(text)
 
     def _init_database(self):
         """初始化数据库"""
@@ -144,7 +174,10 @@ class ImageSimilaritySearcher:
                                     if score > 0.6:
                                         texts.append(text)
             
-            return ' '.join(texts)
+            # 合并文本并清理
+            raw_text = ' '.join(texts)
+            cleaned_text = self._clean_text(raw_text)
+            return cleaned_text
         except Exception as e:
             self.logger.error(f"OCR failed for {image_path}: {e}")
             return ""
@@ -388,10 +421,13 @@ class ImageSimilaritySearcher:
             
             img_id, file_path = result
             
+            # 清理OCR文本
+            cleaned_ocr_text = self._clean_text(ocr_text)
+            
             # 更新OCR结果
             cursor.execute(
                 "UPDATE image_features SET ocr_text = ?, ocr_status = 'completed', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
-                (ocr_text, time.time(), img_id)
+                (cleaned_ocr_text, time.time(), img_id)
             )
             self.conn.commit()
             
@@ -510,68 +546,149 @@ class ImageSimilaritySearcher:
             self.logger.error(f"Error during similarity search: {e}")
             return []
 
-    def search_by_text(self, keywords: str, max_results: int = 3) -> List[Dict]:
+    def search_by_text(self, keywords: str, max_results: int = 3, search_mode: str = 'smart') -> List[Dict]:
         """
         根据关键字搜索，支持模糊匹配、分词和简繁互转。
         使用 jieba 对查询关键字进行分词，支持简体和繁体互查。
         返回包含文件路径和消息ID的字典列表。
+        
+        Args:
+            keywords: 搜索关键词
+            max_results: 最大返回结果数
+            search_mode: 搜索模式
+                - 'smart': 智能搜索，优先FTS5，回退到LIKE
+                - 'comprehensive': 全面搜索，FTS5 + LIKE 结果合并去重
+                - 'fts': 仅使用FTS5搜索
+                - 'like': 仅使用LIKE搜索
         """
         cursor = self.conn.cursor()
         try:
-            # 对输入关键字进行分词
-            query_tokens = self._tokenize_text(keywords)
+            # 清理和规范化查询文本
+            cleaned_keywords = self._normalize_query_text(keywords)
+            if not cleaned_keywords:
+                self.logger.warning(f"Query keywords empty after cleaning: '{keywords}'")
+                return []
             
-            if query_tokens:
-                # 获取所有变体（简体和繁体）
-                all_variants = self._get_all_variants(query_tokens)
-                
-                # 构建 FTS5 查询：使用 OR 逻辑（任何一个词匹配即可）
-                # 格式: "token1 OR token2 OR token3 OR ..."
-                fts_query = ' OR '.join(all_variants)
-                
-                try:
-                    # 尝试使用 FTS5 进行全文搜索
-                    cursor.execute('''
-                        SELECT f.file_path, f.telegram_message_id, bm25(image_text_search) as score
-                        FROM image_text_search
-                        JOIN image_features f ON image_text_search.rowid = f.id
-                        WHERE image_text_search MATCH ? ORDER BY score DESC LIMIT ?
-                    ''', (fts_query, max_results))
-                    results = [{'path': row[0], 'telegram_message_id': row[1]} for row in cursor.fetchall()]
-                    
-                    if results:
-                        self.logger.info(f"FTS5 search for '{keywords}' found {len(results)} results using {len(all_variants)} variants")
-                        return results
-                except sqlite3.OperationalError as e:
-                    self.logger.debug(f"FTS5 search failed: {e}, falling back to LIKE search")
-                
-                # 回退方案：使用 LIKE 进行多关键词模糊匹配（包含所有变体）
-                # 构建 LIKE 查询：ANY 条件满足就返回
-                where_clauses = [f"ocr_text LIKE ?" for _ in all_variants]
-                where_sql = ' OR '.join(where_clauses)
-                query_params = [f"%{variant}%" for variant in all_variants] + [max_results]
-                
-                cursor.execute(f'''
-                    SELECT file_path, telegram_message_id FROM image_features 
-                    WHERE {where_sql}
-                    ORDER BY updated_time DESC LIMIT ?
-                ''', query_params)
-                
-                results = [{'path': row[0], 'telegram_message_id': row[1]} for row in cursor.fetchall()]
-                self.logger.info(f"LIKE search for '{keywords}' found {len(results)} results using {len(all_variants)} variants")
-                return results
+            # 对清理后的关键字进行分词
+            query_tokens = self._tokenize_text(cleaned_keywords)
+            
+            if search_mode == 'comprehensive':
+                # 全面搜索模式：合并FTS5和LIKE结果
+                return self._comprehensive_search(cursor, query_tokens, cleaned_keywords, max_results)
+            elif search_mode == 'fts':
+                # 仅FTS5搜索
+                return self._fts_search_only(cursor, query_tokens, max_results)
+            elif search_mode == 'like':
+                # 仅LIKE搜索
+                return self._like_search_only(cursor, query_tokens, cleaned_keywords, max_results)
             else:
-                # 如果分词失败或关键字为空，使用原始关键字进行搜索
-                self.logger.debug(f"No tokens extracted from '{keywords}', using raw keyword")
-                cursor.execute('''
-                    SELECT file_path, telegram_message_id FROM image_features 
-                    WHERE ocr_text LIKE ? ORDER BY updated_time DESC LIMIT ?
-                ''', (f'%{keywords}%', max_results))
+                # 默认智能搜索模式
+                return self._smart_search(cursor, query_tokens, cleaned_keywords, max_results)
                 
-                return [{'path': row[0], 'telegram_message_id': row[1]} for row in cursor.fetchall()]
         except Exception as e:
             self.logger.error(f"Error during text search: {e}")
             return []
+    
+    def _comprehensive_search(self, cursor, query_tokens: List[str], cleaned_keywords: str, max_results: int) -> List[Dict]:
+        """全面搜索：合并FTS5和LIKE结果"""
+        results_map = {}  # 使用字典去重，key为file_path
+        
+        # 1. 先尝试FTS5搜索
+        fts_results = self._fts_search_only(cursor, query_tokens, max_results * 2)  # 获取更多FTS结果
+        for result in fts_results:
+            results_map[result['path']] = result
+        
+        # 2. 如果FTS5结果不足，补充LIKE搜索
+        if len(results_map) < max_results:
+            like_results = self._like_search_only(cursor, query_tokens, cleaned_keywords, max_results * 2)
+            for result in like_results:
+                if result['path'] not in results_map:
+                    results_map[result['path']] = result
+        
+        # 3. 返回结果，按更新时间排序
+        final_results = list(results_map.values())
+        final_results.sort(key=lambda x: x.get('updated_time', 0), reverse=True)
+        
+        self.logger.info(f"Comprehensive search for '{cleaned_keywords}' found {len(final_results)} unique results")
+        return final_results[:max_results]
+    
+    def _fts_search_only(self, cursor, query_tokens: List[str], max_results: int) -> List[Dict]:
+        """仅使用FTS5搜索"""
+        if not query_tokens:
+            return []
+        
+        # 获取所有变体（简体和繁体）
+        all_variants = self._get_all_variants(query_tokens)
+        
+        # 构建 FTS5 查询：使用 OR 逻辑（任何一个词匹配即可）
+        fts_query = ' OR '.join([f'"{variant}"' for variant in all_variants])  # 使用短语查询提高准确性
+        
+        try:
+            cursor.execute('''
+                SELECT f.file_path, f.telegram_message_id, f.updated_time, bm25(image_text_search) as score
+                FROM image_text_search
+                JOIN image_features f ON image_text_search.rowid = f.id
+                WHERE image_text_search MATCH ? ORDER BY score DESC LIMIT ?
+            ''', (fts_query, max_results))
+            
+            results = [{
+                'path': row[0], 
+                'telegram_message_id': row[1],
+                'updated_time': row[2],
+                'search_method': 'FTS5',
+                'score': row[3]
+            } for row in cursor.fetchall()]
+            
+            if results:
+                self.logger.info(f"FTS5 search found {len(results)} results")
+                return results
+                
+        except sqlite3.OperationalError as e:
+            self.logger.debug(f"FTS5 search failed: {e}")
+        
+        return []
+    
+    def _like_search_only(self, cursor, query_tokens: List[str], cleaned_keywords: str, max_results: int) -> List[Dict]:
+        """仅使用LIKE搜索"""
+        if query_tokens:
+            # 使用分词结果
+            all_variants = self._get_all_variants(query_tokens)
+        else:
+            # 回退到原始关键字
+            all_variants = [cleaned_keywords]
+        
+        # 构建 LIKE 查询：ANY 条件满足就返回
+        where_clauses = [f"ocr_text LIKE ?" for _ in all_variants]
+        where_sql = ' OR '.join(where_clauses)
+        query_params = [f"%{variant}%" for variant in all_variants] + [max_results]
+        
+        cursor.execute(f'''
+            SELECT file_path, telegram_message_id, updated_time FROM image_features 
+            WHERE {where_sql}
+            ORDER BY updated_time DESC LIMIT ?
+        ''', query_params)
+        
+        results = [{
+            'path': row[0], 
+            'telegram_message_id': row[1],
+            'updated_time': row[2],
+            'search_method': 'LIKE'
+        } for row in cursor.fetchall()]
+        
+        self.logger.info(f"LIKE search found {len(results)} results")
+        return results
+    
+    def _smart_search(self, cursor, query_tokens: List[str], cleaned_keywords: str, max_results: int) -> List[Dict]:
+        """智能搜索：优先FTS5，不足时回退到LIKE"""
+        # 先尝试FTS5
+        results = self._fts_search_only(cursor, query_tokens, max_results)
+        
+        if results:
+            return results
+        
+        # FTS5无结果时回退到LIKE
+        self.logger.info("FTS5 search returned no results, falling back to LIKE search")
+        return self._like_search_only(cursor, query_tokens, cleaned_keywords, max_results)
 
     def update_archived_file_paths(self, path_mappings: List[Tuple[str, str]]):
         """
@@ -593,6 +710,59 @@ class ImageSimilaritySearcher:
         except Exception as e:
             self.logger.error(f"Failed to update file paths in database during archiving: {e}")
             self.conn.rollback()
+
+    def clean_all_ocr_texts(self) -> Dict[str, int]:
+        """
+        批量清理数据库中所有已完成OCR的文本，移除噪声字符。
+        返回处理统计信息。
+        """
+        cursor = self.conn.cursor()
+        stats = {'total': 0, 'cleaned': 0, 'unchanged': 0, 'errors': 0}
+        
+        try:
+            # 获取所有已完成OCR的记录
+            cursor.execute(
+                "SELECT id, file_path, ocr_text FROM image_features WHERE ocr_status = 'completed' AND ocr_text IS NOT NULL AND ocr_text != ''"
+            )
+            records = cursor.fetchall()
+            stats['total'] = len(records)
+            
+            self.logger.info(f"Starting OCR text cleaning for {stats['total']} records...")
+            
+            for img_id, file_path, original_text in records:
+                try:
+                    if not original_text:
+                        stats['unchanged'] += 1
+                        continue
+                    
+                    cleaned_text = self._clean_text(original_text)
+                    
+                    if cleaned_text != original_text:
+                        # 更新清理后的文本
+                        cursor.execute(
+                            "UPDATE image_features SET ocr_text = ?, updated_time = ? WHERE id = ?",
+                            (cleaned_text, time.time(), img_id)
+                        )
+                        stats['cleaned'] += 1
+                        self.logger.debug(f"Cleaned OCR text for {file_path}: '{original_text}' -> '{cleaned_text}'")
+                    else:
+                        stats['unchanged'] += 1
+                        
+                except Exception as e:
+                    self.logger.error(f"Error cleaning OCR text for image id {img_id}: {e}")
+                    stats['errors'] += 1
+            
+            # 提交所有更改
+            self.conn.commit()
+            
+            self.logger.info(f"OCR text cleaning completed: {stats}")
+            return stats
+            
+        except Exception as e:
+            self.logger.error(f"Error during batch OCR text cleaning: {e}")
+            self.conn.rollback()
+            stats['errors'] = stats['total']
+            return stats
 
     def close(self):
         """关闭数据库连接"""
