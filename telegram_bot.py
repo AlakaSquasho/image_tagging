@@ -516,23 +516,51 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Mode 2: Search by keywords (text after /search command)
     elif context.args:
         try:
-            # 解析搜索模式参数
+            # 解析搜索参数
             search_mode = 'smart'  # 默认模式
-            keywords_args = context.args
+            max_results = MAX_RESULTS  # 默认结果数
+            keywords_args = list(context.args)
             
-            # 检查是否有搜索模式参数
-            if len(context.args) > 1 and context.args[0].startswith('--'):
-                mode_param = context.args[0][2:]  # 移除 '--'
-                if mode_param in ['smart', 'comprehensive', 'fts', 'like']:
-                    search_mode = mode_param
-                    keywords_args = context.args[1:]  # 剩余参数作为关键词
-                else:
-                    await update.message.reply_text(
-                        f"无效的搜索模式: {mode_param}\n"
-                        f"支持的模式: --smart, --comprehensive, --fts, --like",
-                        reply_to_message_id=update.message.message_id
-                    )
-                    return
+            # 解析参数
+            i = 0
+            while i < len(keywords_args):
+                arg = keywords_args[i]
+                if arg.startswith('--'):
+                    param = arg[2:]  # 移除 '--'
+                    if param in ['smart', 'comprehensive', 'fts', 'like']:
+                        search_mode = param
+                        keywords_args.pop(i)
+                        continue
+                    else:
+                        await update.message.reply_text(
+                            f"无效的搜索模式: {param}\n"
+                            f"支持的模式: --smart, --comprehensive, --fts, --like",
+                            reply_to_message_id=update.message.message_id
+                        )
+                        return
+                elif arg.startswith('-n=') or arg.startswith('--max=') or (arg.startswith('-') and arg[1:].isdigit()):
+                    # 解析结果数参数，支持 -n=5, --max=5, -5 三种格式
+                    try:
+                        if arg.startswith('-n='):
+                            max_results = int(arg[3:])
+                        elif arg.startswith('--max='):
+                            max_results = int(arg[6:])
+                        elif arg.startswith('-') and arg[1:].isdigit():
+                            # 支持 -5 这种简化格式
+                            max_results = int(arg[1:])
+                        
+                        if max_results <= 0:
+                            raise ValueError("结果数必须大于0")
+                        keywords_args.pop(i)
+                        continue
+                    except ValueError as e:
+                        await update.message.reply_text(
+                            f"无效的结果数参数: {arg}\n"
+                            f"请使用 -数字, -n=数字 或 --max=数字 格式，如 -5 或 -n=5",
+                            reply_to_message_id=update.message.message_id
+                        )
+                        return
+                i += 1
             
             keywords = " ".join(keywords_args)
             if not keywords.strip():
@@ -542,13 +570,16 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "• `/search 关键词` (智能模式)\n"
                     "• `/search --comprehensive 关键词` (全面搜索)\n"
                     "• `/search --fts 关键词` (仅FTS5)\n"
-                    "• `/search --like 关键词` (仅模糊匹配)",
+                    "• `/search --like 关键词` (仅模糊匹配)\n"
+                    "• `/search -5 关键词` (限制5个结果)\n"
+                    "• `/search -n=5 关键词` (限制5个结果)\n"
+                    "• `/search --max=10 --comprehensive 关键词` (全面搜索，最多10个结果)",
                     parse_mode='Markdown',
                     reply_to_message_id=update.message.message_id
                 )
                 return
             
-            results = searcher.search_by_text(keywords, max_results=MAX_RESULTS, search_mode=search_mode)
+            results = searcher.search_by_text(keywords, max_results=max_results, search_mode=search_mode)
             if not results:
                 await update.message.reply_text(
                     f"未找到文本匹配结果 (模式: {search_mode})。", 
@@ -564,38 +595,84 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'like': '模糊匹配'
             }.get(search_mode, search_mode)
             
-            # 当只有一个结果时，合并为一句话
+            # 当只有一个结果时
             if len(results) == 1:
                 result = results[0]
                 if result.get('telegram_message_id'):
                     message = f"找到1个文本匹配结果 ({mode_desc}模式)，原消息ID：{result['telegram_message_id']}"
+                    await update.message.reply_text(message, reply_to_message_id=update.message.message_id, parse_mode='HTML')
                 else:
                     filename = os.path.basename(result['path'])
                     message = f"找到1个文本匹配结果 ({mode_desc}模式)，文件路径：<code>{filename}</code>"
-                
-                await update.message.reply_text(message, reply_to_message_id=update.message.message_id, parse_mode='HTML')
+                    await update.message.reply_text(message, reply_to_message_id=update.message.message_id, parse_mode='HTML')
+                    
+                    # 发送图片文件
+                    try:
+                        if os.path.exists(result['path']):
+                            with open(result['path'], 'rb') as photo:
+                                await context.bot.send_photo(
+                                    chat_id=update.effective_chat.id,
+                                    photo=InputFile(photo, filename=filename),
+                                    caption=f"📁 {filename}",
+                                    reply_to_message_id=update.message.message_id
+                                )
+                    except Exception as e:
+                        logger.error(f"发送搜索结果图片失败: {e}")
+                        await update.message.reply_text(f"发送图片失败: {filename}")
             else:
-                # 当有多个结果时，先回复总数，再合并所有结果到一条消息
+                # 当有多个结果时，先回复总数
                 await update.message.reply_text(
                     f"找到 {len(results)} 个文本匹配结果 ({mode_desc}模式):", 
                     reply_to_message_id=update.message.message_id
                 )
                 
-                result_messages = []
-                for idx, result in enumerate(results, 1):
-                    if result.get('telegram_message_id'):
-                        result_messages.append(f"{idx}. 原消息ID：{result['telegram_message_id']}")
-                    else:
-                        filename = os.path.basename(result['path'])
-                        result_messages.append(f"{idx}. 文件路径：<code>{filename}</code>")
+                # 分类处理结果：有消息ID的和没有消息ID的
+                with_message_id = []
+                without_message_id = []
                 
-                combined_message = "\n".join(result_messages)
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=combined_message,
-                    parse_mode='HTML',
-                    reply_to_message_id=update.message.message_id
-                )
+                for result in results:
+                    if result.get('telegram_message_id'):
+                        with_message_id.append(result)
+                    else:
+                        without_message_id.append(result)
+                
+                # 处理有消息ID的结果 - 合并为一条消息
+                if with_message_id:
+                    message_lines = []
+                    for idx, result in enumerate(with_message_id, 1):
+                        message_lines.append(f"{idx}. 原消息ID：{result['telegram_message_id']}")
+                    
+                    combined_message = "\n".join(message_lines)
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=combined_message,
+                        parse_mode='HTML'
+                    )
+                
+                # 处理没有消息ID的结果 - 单条发送并附带图片
+                for idx, result in enumerate(without_message_id, len(with_message_id) + 1):
+                    filename = os.path.basename(result['path'])
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=f"{idx}. 文件路径：<code>{filename}</code>",
+                        parse_mode='HTML'
+                    )
+                    
+                    # 发送图片文件
+                    try:
+                        if os.path.exists(result['path']):
+                            with open(result['path'], 'rb') as photo:
+                                await context.bot.send_photo(
+                                    chat_id=update.effective_chat.id,
+                                    photo=InputFile(photo, filename=filename),
+                                    caption=f"📁 {filename}"
+                                )
+                    except Exception as e:
+                        logger.error(f"发送搜索结果图片失败: {e}")
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text=f"⚠️ 发送图片失败: {filename}"
+                        )
         except Exception as e:
             logger.error(f"Error during text search: {e}", exc_info=True)
             await update.message.reply_text("文本搜索时发生错误。", reply_to_message_id=update.message.message_id)
