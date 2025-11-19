@@ -695,6 +695,8 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     与定时任务不同的是，/forceOCR 会一次性处理所有待处理的图片，
     不受 OCR_BATCH_SIZE 的限制（但内存允许的情况下）
     """
+    import gc
+    
     if update.message.from_user.id != ALLOWED_USER_ID:
         logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /forceOCR.")
         return
@@ -762,6 +764,10 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if stats['processed'] == 0:
                 logger.warning(f"No images were processed in iteration {iteration}, stopping.")
                 break
+            
+            # 每批次处理后显式触发垃圾回收，及时释放内存
+            # 注意：OCR引擎采用懒加载模式，每批处理完会自动清理，下次需要时自动加载
+            gc.collect()
         
         # 计算总耗时
         end_time = datetime.now()
@@ -809,6 +815,11 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=message
         )
         logger.info(f"Force OCR completed: {total_stats}, iterations: {iteration}")
+        
+        # 最终垃圾回收，确保所有OCR处理产生的临时对象被清理
+        gc.collect()
+        logger.info(f"Memory cleanup completed after force OCR")
+        
     except Exception as e:
         logger.error(f"Error during force OCR: {e}", exc_info=True)
         error_message = f"❌ OCR处理出现错误: {str(e)}\n\n请检查日志文件或重试。"
@@ -1060,6 +1071,8 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
     为了避免OCR任务积压，本任务会循环调用process_ocr_pending_images，
     直到所有待处理的图片都被处理完成。
     """
+    import gc
+    
     task_start_time = datetime.now()
     logger.info(f"Scheduled OCR task started at: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
@@ -1101,6 +1114,10 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
                 break
             
             logger.info(f"Iteration {iteration} completed: {stats}")
+            
+            # 每批次处理后显式触发垃圾回收
+            # 注意：OCR引擎采用懒加载模式，每批处理完会自动清理，下次需要时自动加载
+            gc.collect()
         
         # 计算任务耗时
         task_end_time = datetime.now()
@@ -1130,6 +1147,10 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
         
         await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=message)
         logger.info(f"Scheduled OCR task completed successfully: {total_stats}, iterations: {iteration}, duration: {duration_str}")
+        
+        # 最终垃圾回收
+        gc.collect()
+        logger.info(f"Memory cleanup completed after scheduled OCR task")
         
     except Exception as e:
         task_duration = datetime.now() - task_start_time

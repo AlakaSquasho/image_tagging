@@ -5,6 +5,7 @@ from typing import List, Dict, Optional, Tuple
 import time
 import logging
 import re
+import gc
 
 from PIL import Image
 import imagehash
@@ -24,14 +25,9 @@ class ImageSimilaritySearcher:
         self.logger = logging.getLogger(__name__)
         self._init_database()
         
-        # Initialize PaddleOCR once to avoid repeated loading overhead
-        try:
-            # 使用默认参数初始化，兼容所有版本
-            self.ocr_engine = PaddleOCR()
-            self.logger.info("ImageSimilaritySearcher initialized with PaddleOCR.")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize PaddleOCR: {e}")
-            self.ocr_engine = None
+        # OCR引擎采用懒加载模式，不在初始化时加载
+        self.ocr_engine = None
+        self.logger.info("ImageSimilaritySearcher initialized with lazy-loading OCR engine.")
         
         # 初始化中文分词器
         try:
@@ -47,6 +43,17 @@ class ImageSimilaritySearcher:
             self.logger.info("OpenCC simplified-traditional Chinese converters initialized.")
         except Exception as e:
             self.logger.warning(f"Failed to initialize OpenCC: {e}. Simplified-traditional conversion may not work.")
+
+    def _ensure_ocr_engine(self):
+        """确保OCR引擎已加载（懒加载模式）"""
+        if self.ocr_engine is None:
+            try:
+                self.logger.info("Loading OCR engine on demand...")
+                self.ocr_engine = PaddleOCR()
+                self.logger.info("OCR engine loaded successfully")
+            except Exception as e:
+                self.logger.error(f"Failed to load OCR engine: {e}")
+                raise
 
     def _clean_text(self, text: str) -> str:
         """
@@ -133,10 +140,16 @@ class ImageSimilaritySearcher:
             raise
 
     def _extract_text_from_image(self, image_path: str) -> str:
-        """使用PaddleOCR从图片中提取文本"""
+        """使用PaddleOCR从图片中提取文本（懒加载模式）"""
+        # 懒加载：在实际需要OCR时才加载引擎
+        self._ensure_ocr_engine()
+        
         if self.ocr_engine is None:
-            self.logger.error(f"OCR engine not initialized")
+            self.logger.error(f"OCR engine failed to load")
             return ""
+        
+        result = None
+        texts = []
         
         try:
             # PaddleOCR API - 直接调用，不使用任何特殊参数
@@ -145,7 +158,6 @@ class ImageSimilaritySearcher:
             if not result or not result[0]:
                 return ""
             
-            texts = []
             for line in result:
                 # 处理新格式：result 是字典，包含 'rec_texts' 和 'rec_scores'
                 if isinstance(line, dict):
@@ -181,6 +193,12 @@ class ImageSimilaritySearcher:
         except Exception as e:
             self.logger.error(f"OCR failed for {image_path}: {e}")
             return ""
+        finally:
+            # 显式释放OCR结果占用的内存
+            del result
+            del texts
+            # 触发垃圾回收，清理OCR产生的临时对象
+            gc.collect()
 
     def _tokenize_text(self, text: str) -> List[str]:
         """
@@ -237,6 +255,7 @@ class ImageSimilaritySearcher:
         """
         从图片中提取文件哈希、感知哈希和（可选）OCR文本。
         """
+        img = None
         try:
             img = Image.open(image_path)
             features = {
@@ -253,6 +272,13 @@ class ImageSimilaritySearcher:
         except Exception as e:
             self.logger.error(f"Feature extraction failed for {image_path}: {e}")
             return None
+        finally:
+            # 确保图像对象被正确关闭，释放内存
+            if img is not None:
+                try:
+                    img.close()
+                except Exception as e:
+                    self.logger.debug(f"Failed to close image: {e}")
 
     def add_image_to_index(self, file_path: str, telegram_message_id: str) -> bool:
         """
@@ -308,6 +334,9 @@ class ImageSimilaritySearcher:
             
             self.logger.info(f"Processing {len(pending_images)} images for OCR...")
             
+            # 在处理前确保OCR引擎已加载
+            self._ensure_ocr_engine()
+            
             for img_id, file_path in pending_images:
                 if not os.path.exists(file_path):
                     self.logger.warning(f"Image file not found: {file_path}. Marking as skipped.")
@@ -339,6 +368,14 @@ class ImageSimilaritySearcher:
         except Exception as e:
             self.logger.error(f"Error during batch OCR processing: {e}", exc_info=True)
             return stats
+        finally:
+            # 关闭游标释放资源
+            if cursor:
+                cursor.close()
+            # 处理完成后立即清理OCR资源，释放内存
+            self.cleanup_ocr_resources()
+            # 每批处理完成后显式触发垃圾回收
+            gc.collect()
 
     def _update_ocr_result(self, img_id: int, ocr_text: str, status: str, fail_count: int):
         """更新OCR结果"""
@@ -764,8 +801,41 @@ class ImageSimilaritySearcher:
             stats['errors'] = stats['total']
             return stats
 
+    def cleanup_ocr_resources(self):
+        """清理OCR引擎占用的内存资源"""
+        try:
+            if hasattr(self, 'ocr_engine') and self.ocr_engine is not None:
+                # 尝试清理PaddleOCR的内部资源
+                if hasattr(self.ocr_engine, 'text_detector'):
+                    del self.ocr_engine.text_detector
+                if hasattr(self.ocr_engine, 'text_recognizer'):
+                    del self.ocr_engine.text_recognizer
+                if hasattr(self.ocr_engine, 'text_classifier'):
+                    del self.ocr_engine.text_classifier
+                
+                # 清理主引擎对象
+                del self.ocr_engine
+                self.ocr_engine = None
+                
+                # 触发垃圾回收
+                gc.collect()
+                self.logger.info("OCR resources cleaned up successfully")
+        except Exception as e:
+            self.logger.warning(f"Failed to cleanup OCR resources: {e}")
+    
+    def reinitialize_ocr(self):
+        """重新初始化OCR引擎（在清理后使用）- 懒加载模式下不需要主动调用"""
+        # 懒加载模式下，OCR引擎会在下次需要时自动加载
+        # 这个方法保留是为了兼容性，实际上什么都不做
+        self.logger.info("OCR engine will be lazy-loaded when needed")
+        pass
+
     def close(self):
-        """关闭数据库连接"""
+        """关闭数据库连接并清理资源"""
+        # 清理OCR资源
+        self.cleanup_ocr_resources()
+        
+        # 关闭数据库连接
         if self.conn:
             self.conn.close()
             self.logger.info("Database connection closed.")
