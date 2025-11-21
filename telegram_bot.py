@@ -249,8 +249,8 @@ async def handle_photo_with_retry(update: Update, context: ContextTypes.DEFAULT_
             
             logger.info(f"Downloaded photo to temporary path {temp_save_path} (attempt {attempt + 1})")
 
-            # Check if the message caption contains the /search command
-            if update.message.caption and update.message.caption.strip().lower() == '/search':
+            # Check if the message caption contains the /find command
+            if update.message.caption and update.message.caption.strip().lower() == '/find':
                 # --- Execute search logic ---
                 await search_by_image(update, context, temp_save_path)
                 return True
@@ -352,7 +352,7 @@ async def handle_photo_with_retry(update: Update, context: ContextTypes.DEFAULT_
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     处理用户发送的图片。
-    - 如果图片附带 /search 命令，则执行搜索。
+    - 如果图片附带 /find 命令（caption），则执行搜索。
     - 否则，检查图片是否已存在。若不存在，则添加索引；若存在，则根据是否有原消息ID返回相应结果。
     
     现在包含重试机制：如果处理失败，会自动重试，重试次数与OCR配置保持一致。
@@ -475,8 +475,8 @@ async def search_by_image(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
         await update.message.reply_text("搜索时发生意外错误。", reply_to_message_id=update.message.message_id)
 
 
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理 /search 命令 (文本或回复)"""
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 /find 命令 (文本或图片搜索)"""
     if update.message.from_user.id != ALLOWED_USER_ID:
         logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /search.")
         return
@@ -527,14 +527,17 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 arg = keywords_args[i]
                 if arg.startswith('--'):
                     param = arg[2:]  # 移除 '--'
+                    # 支持 --com 作为 --comprehensive 的别名
+                    if param == 'com':
+                        param = 'comprehensive'
                     if param in ['smart', 'comprehensive', 'fts', 'like']:
                         search_mode = param
                         keywords_args.pop(i)
                         continue
                     else:
                         await update.message.reply_text(
-                            f"无效的搜索模式: {param}\n"
-                            f"支持的模式: --smart, --comprehensive, --fts, --like",
+                            f"无效的搜索模式: {arg}\n"
+                            f"支持的模式: --smart, --comprehensive (--com), --fts, --like",
                             reply_to_message_id=update.message.message_id
                         )
                         return
@@ -569,11 +572,12 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "用法示例：\n"
                     "• `/search 关键词` (智能模式)\n"
                     "• `/search --comprehensive 关键词` (全面搜索)\n"
+                    "• `/search --com 关键词` (全面搜索，--comprehensive 的简写)\n"
                     "• `/search --fts 关键词` (仅FTS5)\n"
                     "• `/search --like 关键词` (仅模糊匹配)\n"
                     "• `/search -5 关键词` (限制5个结果)\n"
                     "• `/search -n=5 关键词` (限制5个结果)\n"
-                    "• `/search --max=10 --comprehensive 关键词` (全面搜索，最多10个结果)",
+                    "• `/search --max=10 --com 关键词` (全面搜索，最多10个结果)",
                     parse_mode='Markdown',
                     reply_to_message_id=update.message.message_id
                 )
@@ -677,22 +681,22 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error during text search: {e}", exc_info=True)
             await update.message.reply_text("文本搜索时发生错误。", reply_to_message_id=update.message.message_id)
     
-    # Invalid usage of /search command
+    # Invalid usage of /find command
     else:
         help_text = """使用方法：
-1. <code>/search &lt;关键词&gt;</code> (智能模式文本搜索)
-2. <code>/search --comprehensive &lt;关键词&gt;</code> (全面搜索，合并FTS5和模糊匹配结果)
-3. <code>/search --fts &lt;关键词&gt;</code> (仅使用FTS5全文搜索)
-4. <code>/search --like &lt;关键词&gt;</code> (仅使用模糊匹配)
-5. 回复一张图片并发送 <code>/search</code> (图片搜索)"""
+1. <code>/find &lt;关键词&gt;</code> (智能模式文本搜索)
+2. <code>/find --comprehensive &lt;关键词&gt;</code> 或 <code>/find --com &lt;关键词&gt;</code> (全面搜索)
+3. <code>/find --fts &lt;关键词&gt;</code> (仅使用FTS5全文搜索)
+4. <code>/find --like &lt;关键词&gt;</code> (仅使用模糊匹配)
+5. 回复一张图片并发送 <code>/find</code> (图片搜索)"""
         await update.message.reply_text(help_text, parse_mode='HTML', reply_to_message_id=update.message.message_id)
 
 
-async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    处理 /forceOCR 命令，立即对所有未OCR的图片进行OCR处理
+    处理 /ocr 命令，立即对所有未OCR的图片进行OCR处理
     
-    与定时任务不同的是，/forceOCR 会一次性处理所有待处理的图片，
+    与定时任务不同的是，/ocr 会一次性处理所有待处理的图片，
     不受 OCR_BATCH_SIZE 的限制（但内存允许的情况下）
     """
     import gc
@@ -833,11 +837,11 @@ async def force_ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(error_message)
 
 
-async def setocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    处理 /setocr 命令，手动设置OCR结果。
-    命令用法：回复一张图片并发送 "/setocr 文本内容"
-    例如：/setocr 猫 薛条 可爱
+    处理 /tag 命令，手动设置OCR结果。
+    命令用法：回复一张图片并发送 "/tag 文本内容"
+    例如：/tag 猫 薛条 可爱
     """
     if update.message.from_user.id != ALLOWED_USER_ID:
         logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /setocr.")
@@ -846,8 +850,8 @@ async def setocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 检查是否回复了一个消息
     if not update.message.reply_to_message:
         await update.message.reply_text(
-            "请回复一个包含图片的消息并使用 /setocr 命令。\n\n"
-            "用法：回复图片后发送 `/setocr 文本内容`",
+            "请回复一个包含图片的消息并使用 /tag 命令。\n\n"
+            "用法：回复图片后发送 `/tag 文本内容`",
             parse_mode='Markdown',
             reply_to_message_id=update.message.message_id
         )
@@ -866,7 +870,7 @@ async def setocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "请提供OCR文本内容。\n\n"
-            "用法：`/setocr 文本内容`",
+            "用法：`/tag 文本内容`",
             parse_mode='Markdown',
             reply_to_message_id=update.message.message_id
         )
@@ -913,30 +917,26 @@ async def setocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # 获取图片的telegram_message_id
+            # 获取图片的file_hash和telegram_message_id
             image_record = similar_results[0]
+            file_hash = image_record.get('file_hash')
             telegram_message_id_in_db = image_record.get('telegram_message_id')
             
-            if not telegram_message_id_in_db:
-                await update.message.reply_text(
-                    "该图片没有对应的Telegram消息ID，无法设置OCR。",
-                    reply_to_message_id=update.message.message_id
-                )
-                return
-            
-            # 设置OCR结果
-            success = searcher.set_manual_ocr_result(telegram_message_id_in_db, ocr_text)
+            # 通过file_hash设置OCR结果（支持没有message_id的图片）
+            success = searcher.set_manual_ocr_result_by_hash(file_hash, ocr_text)
             
             if success:
                 pending_count = searcher.get_pending_ocr_count()
+                msg_info = f"消息ID: {telegram_message_id_in_db}" if telegram_message_id_in_db else "(无消息ID)"
                 await update.message.reply_text(
                     f"✅ OCR结果已成功设置。\n\n"
                     f"OCR内容: `{ocr_text}`\n"
+                    f"{msg_info}\n"
                     f"当前待处理OCR图片数: {pending_count}",
                     parse_mode='Markdown',
                     reply_to_message_id=update.message.message_id
                 )
-                logger.info(f"User manually set OCR result for message_id {telegram_message_id_in_db}: '{ocr_text}'")
+                logger.info(f"User manually set OCR result for file_hash {file_hash}: '{ocr_text}'")
             else:
                 await update.message.reply_text(
                     "❌ 设置OCR结果失败，请检查日志。",
@@ -953,26 +953,148 @@ async def setocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Failed to clean up temporary file {temp_file_path}: {e}")
     
     except Exception as e:
-        logger.error(f"Error in setocr_command: {e}", exc_info=True)
+        logger.error(f"Error in tag_command: {e}", exc_info=True)
         await update.message.reply_text(
-            "处理/setocr命令时发生错误，请检查日志。",
+            "处理/tag命令时发生错误，请检查日志。",
             reply_to_message_id=update.message.message_id
         )
 
 
-async def clearocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def setmessageid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    处理 /clearocr 命令，清除OCR结果。
-    命令用法：回复一张图片并发送 "/clearocr"
+    处理 /link 命令，为图片设置Telegram消息ID。
+    命令用法：回复一张图片并发送 "/link <消息ID或链接>"
+    例如：/link https://t.me/channel/12345
     """
     if update.message.from_user.id != ALLOWED_USER_ID:
-        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /clearocr.")
+        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /link.")
         return
     
     # 检查是否回复了一个消息
     if not update.message.reply_to_message:
         await update.message.reply_text(
-            "请回复一个包含图片的消息并使用 /clearocr 命令。",
+            "请回复一个包含图片的消息并使用 /link 命令。\n\n"
+            "用法：回复图片后发送 `/link <消息ID或链接>`",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 检查回复的消息是否包含图片
+    replied_message = update.message.reply_to_message
+    if not replied_message.photo:
+        await update.message.reply_text(
+            "请回复一个包含图片的消息。",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 获取消息ID
+    if not context.args:
+        await update.message.reply_text(
+            "请提供消息ID或链接。\n\n"
+            "用法：`/link <消息ID或链接>`",
+            parse_mode='Markdown',
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 连接所有参数作为消息ID
+    message_id = " ".join(context.args)
+    
+    try:
+        # 下载图片并获取其特征
+        photo = replied_message.photo[-1]
+        file_ext = os.path.splitext(photo.file_unique_id)[1] or '.jpg'
+        temp_file_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"temp_setmsgid_{uuid4()}{file_ext}")
+        
+        try:
+            if not os.path.exists(IMAGE_DOWNLOAD_PATH):
+                os.makedirs(IMAGE_DOWNLOAD_PATH, exist_ok=True)
+            
+            file = await context.bot.get_file(photo.file_id)
+            await file.download_to_drive(temp_file_path)
+            
+            if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) == 0:
+                logger.error(f"Downloaded file is empty or doesn't exist: {temp_file_path}")
+                await update.message.reply_text(
+                    "下载图片失败，无法设置消息ID。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 通过图片特征查找数据库中的记录
+            similar_results = searcher.search_similar_images(temp_file_path, threshold=0, max_results=1)
+            
+            if not similar_results or similar_results[0].get('similarity') != 1.0:
+                await update.message.reply_text(
+                    "未在数据库中找到该图片的记录。\n\n"
+                    "请确认该图片已经被索引。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 获取图片信息
+            image_record = similar_results[0]
+            file_hash = image_record.get('file_hash')
+            existing_message_id = image_record.get('telegram_message_id')
+            
+            # 检查是否已有消息ID
+            if existing_message_id:
+                await update.message.reply_text(
+                    f"该图片已有消息ID：{existing_message_id}\n\n"
+                    f"无法覆盖已存在的消息ID。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 设置消息ID
+            success = searcher.set_message_id_by_hash(file_hash, message_id)
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ 消息ID已成功设置。\n\n"
+                    f"消息ID: `{message_id}`",
+                    parse_mode='Markdown',
+                    reply_to_message_id=update.message.message_id
+                )
+                logger.info(f"User manually set message_id for file_hash {file_hash}: '{message_id}'")
+            else:
+                await update.message.reply_text(
+                    "❌ 设置消息ID失败，请检查日志。",
+                    reply_to_message_id=update.message.message_id
+                )
+        
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                    logger.info(f"Cleaned up temporary file: {temp_file_path}")
+                except OSError as e:
+                    logger.error(f"Failed to clean up temporary file {temp_file_path}: {e}")
+    
+    except Exception as e:
+        logger.error(f"Error in setmessageid_command: {e}", exc_info=True)
+        await update.message.reply_text(
+            "处理/link命令时发生错误，请检查日志。",
+            reply_to_message_id=update.message.message_id
+        )
+
+
+async def untag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    处理 /untag 命令，清除OCR结果。
+    命令用法：回复一张图片并发送 "/untag"
+    """
+    if update.message.from_user.id != ALLOWED_USER_ID:
+        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /untag.")
+        return
+    
+    # 检查是否回复了一个消息
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "请回复一个包含图片的消息并使用 /untag 命令。",
             reply_to_message_id=update.message.message_id
         )
         return
@@ -1057,9 +1179,9 @@ async def clearocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Failed to clean up temporary file {temp_file_path}: {e}")
     
     except Exception as e:
-        logger.error(f"Error in clearocr_command: {e}", exc_info=True)
+        logger.error(f"Error in untag_command: {e}", exc_info=True)
         await update.message.reply_text(
-            "处理/clearocr命令时发生错误，请检查日志。",
+            "处理/untag命令时发生错误，请检查日志。",
             reply_to_message_id=update.message.message_id
         )
 
@@ -1200,11 +1322,12 @@ if __name__ == '__main__':
     
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Add handlers
-    application.add_handler(CommandHandler('search', search_command))
-    application.add_handler(CommandHandler('forceOCR', force_ocr_command))
-    application.add_handler(CommandHandler('setocr', setocr_command))
-    application.add_handler(CommandHandler('clearocr', clearocr_command))
+    # Add handlers - 新命令体系，首字母即可区分
+    application.add_handler(CommandHandler('find', find_command))      # 搜索（替代search）
+    application.add_handler(CommandHandler('ocr', ocr_command))        # OCR处理（替代forceOCR）
+    application.add_handler(CommandHandler('tag', tag_command))        # 设置标签（替代setocr）
+    application.add_handler(CommandHandler('untag', untag_command))    # 清除标签（替代clearocr）
+    application.add_handler(CommandHandler('link', setmessageid_command))  # 设置消息ID（新命令）
     # handle_photo processes all photo messages, internal logic decides add or search
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     

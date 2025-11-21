@@ -475,6 +475,105 @@ class ImageSimilaritySearcher:
             self.logger.error(f"Failed to set manual OCR result for message_id {telegram_message_id}: {e}")
             self.conn.rollback()
             return False
+    
+    def set_manual_ocr_result_by_hash(self, file_hash: str, ocr_text: str) -> bool:
+        """
+        通过file_hash手动设置图片的OCR结果（支持没有message_id的图片）。
+        将OCR文本设置为指定内容，状态修改为'completed'，失败计数重置为0。
+        
+        Args:
+            file_hash: 文件哈希值
+            ocr_text: 要设置的OCR文本内容
+            
+        Returns:
+            bool: 成功返回True，失败返回False
+        """
+        if not file_hash or not isinstance(ocr_text, str):
+            self.logger.warning("Invalid parameters for set_manual_ocr_result_by_hash")
+            return False
+        
+        cursor = self.conn.cursor()
+        try:
+            # 查找对应的图片记录
+            cursor.execute(
+                "SELECT id, file_path FROM image_features WHERE file_hash = ?",
+                (file_hash,)
+            )
+            result = cursor.fetchone()
+            
+            if not result:
+                self.logger.warning(f"No image found with file_hash: {file_hash}")
+                return False
+            
+            img_id, file_path = result
+            
+            # 清理OCR文本
+            cleaned_ocr_text = self._clean_text(ocr_text)
+            
+            # 更新OCR结果
+            cursor.execute(
+                "UPDATE image_features SET ocr_text = ?, ocr_status = 'completed', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
+                (cleaned_ocr_text, time.time(), img_id)
+            )
+            self.conn.commit()
+            
+            self.logger.info(f"Manually set OCR result for {file_path} (file_hash: {file_hash}): '{ocr_text}'")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to set manual OCR result for file_hash {file_hash}: {e}")
+            self.conn.rollback()
+            return False
+    
+    def set_message_id_by_hash(self, file_hash: str, message_id: str) -> bool:
+        """
+        通过file_hash设置图片的Telegram消息ID（仅限不存在message_id的记录）。
+        
+        Args:
+            file_hash: 文件哈希值
+            message_id: Telegram消息ID
+            
+        Returns:
+            bool: 成功返回True，失败返回False
+        """
+        if not file_hash or not message_id:
+            self.logger.warning("Invalid parameters for set_message_id_by_hash")
+            return False
+        
+        cursor = self.conn.cursor()
+        try:
+            # 查找对应的图片记录，确保没有message_id
+            cursor.execute(
+                "SELECT id, file_path, telegram_message_id FROM image_features WHERE file_hash = ?",
+                (file_hash,)
+            )
+            result = cursor.fetchone()
+            
+            if not result:
+                self.logger.warning(f"No image found with file_hash: {file_hash}")
+                return False
+            
+            img_id, file_path, existing_message_id = result
+            
+            # 检查是否已有message_id
+            if existing_message_id:
+                self.logger.warning(f"Image already has message_id: {existing_message_id}")
+                return False
+            
+            # 更新message_id
+            cursor.execute(
+                "UPDATE image_features SET telegram_message_id = ?, updated_time = ? WHERE id = ?",
+                (message_id, time.time(), img_id)
+            )
+            self.conn.commit()
+            
+            self.logger.info(f"Set message_id for {file_path} (file_hash: {file_hash}): '{message_id}'")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to set message_id for file_hash {file_hash}: {e}")
+            self.conn.rollback()
+            return False
 
     def clear_ocr_result(self, telegram_message_id: str) -> bool:
         """
