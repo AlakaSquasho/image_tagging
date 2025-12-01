@@ -733,7 +733,12 @@ async def ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
             
             logger.info(f"Force OCR iteration {iteration}: Processing {remaining} pending images...")
-            stats = searcher.process_ocr_pending_images(batch_size=OCR_BATCH_SIZE, max_retries=OCR_MAX_RETRIES)
+            # Run blocking OCR task in a separate thread
+            loop = asyncio.get_running_loop()
+            stats = await loop.run_in_executor(
+                None, 
+                lambda: searcher.process_ocr_pending_images(batch_size=OCR_BATCH_SIZE, max_retries=OCR_MAX_RETRIES)
+            )
             
             # 累计统计
             total_stats['processed'] += stats['processed']
@@ -1186,6 +1191,151 @@ async def untag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def getocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    处理 /getocr 命令，查询图片的OCR结果。
+    命令用法：
+    1. 回复一张图片并发送 "/getocr"
+    2. 或使用 "/getocr -l <消息ID>" 直接查询
+    """
+    if update.message.from_user.id != ALLOWED_USER_ID:
+        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /getocr.")
+        return
+    
+    # 检查是否使用 -l 参数
+    message_id_from_arg = None
+    if context.args:
+        # 解析参数
+        i = 0
+        while i < len(context.args):
+            arg = context.args[i]
+            if arg == '-l' and i + 1 < len(context.args):
+                message_id_from_arg = context.args[i + 1]
+                break
+            i += 1
+    
+    # 模式1: 使用 -l 参数直接查询
+    if message_id_from_arg:
+        try:
+            ocr_text = searcher.get_ocr_by_message_id(message_id_from_arg)
+            
+            if ocr_text is None:
+                await update.message.reply_text(
+                    f"❌ 未找到消息ID为 `{message_id_from_arg}` 的图片记录。",
+                    parse_mode='Markdown',
+                    reply_to_message_id=update.message.message_id
+                )
+            elif not ocr_text or ocr_text.strip() == '':
+                await update.message.reply_text(
+                    f"❌ 消息ID `{message_id_from_arg}` 对应的图片没有OCR结果。",
+                    parse_mode='Markdown',
+                    reply_to_message_id=update.message.message_id
+                )
+            else:
+                response = f"✅ OCR结果：\n\n`{ocr_text}`"
+                await update.message.reply_text(
+                    response,
+                    parse_mode='Markdown',
+                    reply_to_message_id=update.message.message_id
+                )
+                logger.info(f"User queried OCR result by message_id {message_id_from_arg}: '{ocr_text[:50]}...'")
+        except Exception as e:
+            logger.error(f"Error querying OCR by message_id: {e}", exc_info=True)
+            await update.message.reply_text(
+                "查询OCR结果时发生错误，请检查日志。",
+                reply_to_message_id=update.message.message_id
+            )
+        return
+    
+    # 模式2: 回复消息查询
+    # 检查是否回复了一个消息
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "请使用以下方式之一：\n"
+            "1. 回复一张图片并发送 /getocr\n"
+            "2. 使用 /getocr -l <消息ID>",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 检查回复的消息是否包含图片
+    replied_message = update.message.reply_to_message
+    if not replied_message.photo:
+        await update.message.reply_text(
+            "请回复一个包含图片的消息。",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    try:
+        # 下载图片并获取其特征
+        photo = replied_message.photo[-1]
+        file_ext = os.path.splitext(photo.file_unique_id)[1] or '.jpg'
+        temp_file_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"temp_getocr_{uuid4()}{file_ext}")
+        
+        try:
+            if not os.path.exists(IMAGE_DOWNLOAD_PATH):
+                os.makedirs(IMAGE_DOWNLOAD_PATH, exist_ok=True)
+            
+            file = await context.bot.get_file(photo.file_id)
+            await file.download_to_drive(temp_file_path)
+            
+            if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) == 0:
+                logger.error(f"Downloaded file is empty or doesn't exist: {temp_file_path}")
+                await update.message.reply_text(
+                    "下载图片失败，无法查询OCR。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 通过图片特征查找数据库中的记录
+            similar_results = searcher.search_similar_images(temp_file_path, threshold=0, max_results=1)
+            
+            if not similar_results or similar_results[0].get('similarity') != 1.0:
+                await update.message.reply_text(
+                    "未在数据库中找到该图片的记录。\n\n"
+                    "请确认该图片已经被索引。",
+                    reply_to_message_id=update.message.message_id
+                )
+                return
+            
+            # 获取图片记录
+            image_record = similar_results[0]
+            ocr_text = image_record.get('ocr_text', '')
+            
+            # 检查OCR结果
+            if not ocr_text or ocr_text.strip() == '':
+                await update.message.reply_text(
+                    "❌ 该图片没有OCR结果。",
+                    reply_to_message_id=update.message.message_id
+                )
+            else:
+                # 返回OCR结果
+                response = f"✅ OCR结果：\n\n`{ocr_text}`"
+                await update.message.reply_text(
+                    response,
+                    parse_mode='Markdown',
+                    reply_to_message_id=update.message.message_id
+                )
+                logger.info(f"User queried OCR result: '{ocr_text[:50]}...'")
+        
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                    logger.info(f"Cleaned up temporary file: {temp_file_path}")
+                except OSError as e:
+                    logger.error(f"Failed to clean up temporary file {temp_file_path}: {e}")
+    
+    except Exception as e:
+        logger.error(f"Error in getocr_command: {e}", exc_info=True)
+        await update.message.reply_text(
+            "处理/getocr命令时发生错误，请检查日志。",
+            reply_to_message_id=update.message.message_id
+        )
+
+
 async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
     """
     定时执行OCR任务 - 处理所有待处理的图片
@@ -1222,7 +1372,12 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
                 break
             
             logger.info(f"OCR task iteration {iteration}: Processing {remaining} pending images...")
-            stats = searcher.process_ocr_pending_images(batch_size=OCR_BATCH_SIZE, max_retries=OCR_MAX_RETRIES)
+            # Run blocking OCR task in a separate thread
+            loop = asyncio.get_running_loop()
+            stats = await loop.run_in_executor(
+                None, 
+                lambda: searcher.process_ocr_pending_images(batch_size=OCR_BATCH_SIZE, max_retries=OCR_MAX_RETRIES)
+            )
             
             # 累计统计
             total_stats['processed'] += stats['processed']
@@ -1328,6 +1483,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('tag', tag_command))        # 设置标签（替代setocr）
     application.add_handler(CommandHandler('untag', untag_command))    # 清除标签（替代clearocr）
     application.add_handler(CommandHandler('link', setmessageid_command))  # 设置消息ID（新命令）
+    application.add_handler(CommandHandler('getocr', getocr_command))  # 查询OCR结果（新命令）
     # handle_photo processes all photo messages, internal logic decides add or search
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     

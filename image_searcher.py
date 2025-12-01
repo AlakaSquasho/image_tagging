@@ -620,6 +620,39 @@ class ImageSimilaritySearcher:
             self.conn.rollback()
             return False
 
+    def get_ocr_by_message_id(self, telegram_message_id: str) -> Optional[str]:
+        """
+        通过消息ID获取图片的OCR结果。
+        
+        Args:
+            telegram_message_id: Telegram消息ID
+            
+        Returns:
+            Optional[str]: OCR文本，如果没有结果或未找到则返回None
+        """
+        if not telegram_message_id:
+            self.logger.warning("Invalid telegram_message_id for get_ocr_by_message_id")
+            return None
+        
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT ocr_text FROM image_features WHERE telegram_message_id = ?",
+                (telegram_message_id,)
+            )
+            result = cursor.fetchone()
+            
+            if not result:
+                self.logger.warning(f"No image found with telegram_message_id: {telegram_message_id}")
+                return None
+            
+            ocr_text = result[0]
+            return ocr_text if ocr_text else None
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get OCR result for message_id {telegram_message_id}: {e}")
+            return None
+
     def _hamming_distance(self, hash1: str, hash2: str) -> int:
         """计算两个哈希字符串之间的汉明距离"""
         # Ensure hashes are of the same length, phash is typically 64-bit (16 hex chars)
