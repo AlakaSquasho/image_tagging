@@ -6,6 +6,7 @@ import time
 import logging
 import re
 import gc
+import threading
 
 from PIL import Image
 import imagehash
@@ -19,9 +20,10 @@ class ImageSimilaritySearcher:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        # Allow multiple threads to access the same connection, for a bot this is often needed
-        # but ensure proper synchronization if concurrent writes are possible.
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False) 
+        # 使用线程锁保护数据库操作，避免并发问题
+        self._db_lock = threading.RLock()
+        # 每个线程使用独立的数据库连接
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0) 
         self.logger = logging.getLogger(__name__)
         self._init_database()
         
@@ -290,23 +292,24 @@ class ImageSimilaritySearcher:
         if not features:
             return False
         
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(
-                "INSERT OR REPLACE INTO image_features (file_path, file_hash, phash, ocr_text, telegram_message_id, updated_time, ocr_status, ocr_fail_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (file_path, features['file_hash'], features['phash'], "", telegram_message_id, time.time(), 'pending', 0)
-            )
-            self.conn.commit()
-            self.logger.info(f"Indexed image: {file_path} with telegram_message_id: '{telegram_message_id}'. OCR status: pending")
-            return True
-        except sqlite3.IntegrityError as e:
-            self.logger.error(f"Integrity error when adding image {file_path}: {e}")
-            self.conn.rollback()
-            return False
-        except Exception as e:
-            self.logger.error(f"Failed to add image {file_path} to index: {e}")
-            self.conn.rollback()
-            return False
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO image_features (file_path, file_hash, phash, ocr_text, telegram_message_id, updated_time, ocr_status, ocr_fail_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (file_path, features['file_hash'], features['phash'], "", telegram_message_id, time.time(), 'pending', 0)
+                )
+                self.conn.commit()
+                self.logger.info(f"Indexed image: {file_path} with telegram_message_id: '{telegram_message_id}'. OCR status: pending")
+                return True
+            except sqlite3.IntegrityError as e:
+                self.logger.error(f"Integrity error when adding image {file_path}: {e}")
+                self.conn.rollback()
+                return False
+            except Exception as e:
+                self.logger.error(f"Failed to add image {file_path} to index: {e}")
+                self.conn.rollback()
+                return False
 
     def process_ocr_pending_images(self, batch_size: int = 10, max_retries: int = 3) -> Dict[str, int]:
         """
@@ -315,18 +318,20 @@ class ImageSimilaritySearcher:
         max_retries: 最大重试次数（超过此次数的失败图片将被跳过）
         返回处理统计信息：{'processed': 5, 'succeeded': 4, 'failed': 1, 'skipped': 0}
         """
-        cursor = self.conn.cursor()
         stats = {'processed': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0}
         
         try:
-            # 获取待处理的图片（pending状态或失败次数<max_retries的failed状态）
-            cursor.execute('''
-                SELECT id, file_path FROM image_features 
-                WHERE (ocr_status = 'pending' OR (ocr_status = 'failed' AND ocr_fail_count < ?))
-                LIMIT ?
-            ''', (max_retries, batch_size))
-            
-            pending_images = cursor.fetchall()
+            # 获取待处理的图片（使用锁保护）
+            with self._db_lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT id, file_path FROM image_features 
+                    WHERE (ocr_status = 'pending' OR (ocr_status = 'failed' AND ocr_fail_count < ?))
+                    LIMIT ?
+                ''', (max_retries, batch_size))
+                
+                pending_images = cursor.fetchall()
+                cursor.close()
             
             if not pending_images:
                 self.logger.info("No pending images for OCR processing.")
@@ -354,6 +359,7 @@ class ImageSimilaritySearcher:
                         stats['skipped'] += 1
                         continue
                     
+                    self.logger.debug(f"Processing OCR for {file_path} (id: {img_id})...")
                     ocr_text = self._extract_text_from_image(file_path)
                     self._update_ocr_result(img_id, ocr_text, 'completed', 0)
                     stats['succeeded'] += 1
@@ -369,9 +375,6 @@ class ImageSimilaritySearcher:
             self.logger.error(f"Error during batch OCR processing: {e}", exc_info=True)
             return stats
         finally:
-            # 关闭游标释放资源
-            if cursor:
-                cursor.close()
             # 处理完成后立即清理OCR资源，释放内存
             self.cleanup_ocr_resources()
             # 每批处理完成后显式触发垃圾回收
@@ -379,53 +382,57 @@ class ImageSimilaritySearcher:
 
     def _update_ocr_result(self, img_id: int, ocr_text: str, status: str, fail_count: int):
         """更新OCR结果"""
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(
-                "UPDATE image_features SET ocr_text = ?, ocr_status = ?, ocr_fail_count = ? WHERE id = ?",
-                (ocr_text, status, fail_count, img_id)
-            )
-            self.conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to update OCR result for image id {img_id}: {e}")
-            self.conn.rollback()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE image_features SET ocr_text = ?, ocr_status = ?, ocr_fail_count = ? WHERE id = ?",
+                    (ocr_text, status, fail_count, img_id)
+                )
+                self.conn.commit()
+            except Exception as e:
+                self.logger.error(f"Failed to update OCR result for image id {img_id}: {e}")
+                self.conn.rollback()
 
     def _increment_ocr_fail_count(self, img_id: int):
         """增加OCR失败次数"""
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(
-                "UPDATE image_features SET ocr_status = 'failed', ocr_fail_count = ocr_fail_count + 1 WHERE id = ?",
-                (img_id,)
-            )
-            self.conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to increment OCR fail count for image id {img_id}: {e}")
-            self.conn.rollback()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE image_features SET ocr_status = 'failed', ocr_fail_count = ocr_fail_count + 1 WHERE id = ?",
+                    (img_id,)
+                )
+                self.conn.commit()
+            except Exception as e:
+                self.logger.error(f"Failed to increment OCR fail count for image id {img_id}: {e}")
+                self.conn.rollback()
 
     def _mark_ocr_skipped(self, img_id: int):
         """标记OCR为已跳过（文件不存在）"""
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(
-                "UPDATE image_features SET ocr_status = 'skipped' WHERE id = ?",
-                (img_id,)
-            )
-            self.conn.commit()
-        except Exception as e:
-            self.logger.error(f"Failed to mark image as skipped for id {img_id}: {e}")
-            self.conn.rollback()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE image_features SET ocr_status = 'skipped' WHERE id = ?",
+                    (img_id,)
+                )
+                self.conn.commit()
+            except Exception as e:
+                self.logger.error(f"Failed to mark image as skipped for id {img_id}: {e}")
+                self.conn.rollback()
 
     def get_pending_ocr_count(self) -> int:
         """获取待处理的OCR图片数量"""
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("SELECT COUNT(*) FROM image_features WHERE ocr_status = 'pending'")
-            count = cursor.fetchone()[0]
-            return count
-        except Exception as e:
-            self.logger.error(f"Failed to get pending OCR count: {e}")
-            return 0
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT COUNT(*) FROM image_features WHERE ocr_status = 'pending'")
+                count = cursor.fetchone()[0]
+                return count
+            except Exception as e:
+                self.logger.error(f"Failed to get pending OCR count: {e}")
+                return 0
 
     def set_manual_ocr_result(self, telegram_message_id: str, ocr_text: str) -> bool:
         """
@@ -443,38 +450,39 @@ class ImageSimilaritySearcher:
             self.logger.warning("Invalid parameters for set_manual_ocr_result")
             return False
         
-        cursor = self.conn.cursor()
-        try:
-            # 查找对应的图片记录
-            cursor.execute(
-                "SELECT id, file_path FROM image_features WHERE telegram_message_id = ?",
-                (telegram_message_id,)
-            )
-            result = cursor.fetchone()
-            
-            if not result:
-                self.logger.warning(f"No image found with telegram_message_id: {telegram_message_id}")
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                # 查找对应的图片记录
+                cursor.execute(
+                    "SELECT id, file_path FROM image_features WHERE telegram_message_id = ?",
+                    (telegram_message_id,)
+                )
+                result = cursor.fetchone()
+                
+                if not result:
+                    self.logger.warning(f"No image found with telegram_message_id: {telegram_message_id}")
+                    return False
+                
+                img_id, file_path = result
+                
+                # 清理OCR文本
+                cleaned_ocr_text = self._clean_text(ocr_text)
+                
+                # 更新OCR结果
+                cursor.execute(
+                    "UPDATE image_features SET ocr_text = ?, ocr_status = 'completed', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
+                    (cleaned_ocr_text, time.time(), img_id)
+                )
+                self.conn.commit()
+                
+                self.logger.info(f"Manually set OCR result for {file_path} (message_id: {telegram_message_id}): '{ocr_text}'")
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Failed to set manual OCR result for message_id {telegram_message_id}: {e}")
+                self.conn.rollback()
                 return False
-            
-            img_id, file_path = result
-            
-            # 清理OCR文本
-            cleaned_ocr_text = self._clean_text(ocr_text)
-            
-            # 更新OCR结果
-            cursor.execute(
-                "UPDATE image_features SET ocr_text = ?, ocr_status = 'completed', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
-                (cleaned_ocr_text, time.time(), img_id)
-            )
-            self.conn.commit()
-            
-            self.logger.info(f"Manually set OCR result for {file_path} (message_id: {telegram_message_id}): '{ocr_text}'")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to set manual OCR result for message_id {telegram_message_id}: {e}")
-            self.conn.rollback()
-            return False
     
     def set_manual_ocr_result_by_hash(self, file_hash: str, ocr_text: str) -> bool:
         """
@@ -492,38 +500,39 @@ class ImageSimilaritySearcher:
             self.logger.warning("Invalid parameters for set_manual_ocr_result_by_hash")
             return False
         
-        cursor = self.conn.cursor()
-        try:
-            # 查找对应的图片记录
-            cursor.execute(
-                "SELECT id, file_path FROM image_features WHERE file_hash = ?",
-                (file_hash,)
-            )
-            result = cursor.fetchone()
-            
-            if not result:
-                self.logger.warning(f"No image found with file_hash: {file_hash}")
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                # 查找对应的图片记录
+                cursor.execute(
+                    "SELECT id, file_path FROM image_features WHERE file_hash = ?",
+                    (file_hash,)
+                )
+                result = cursor.fetchone()
+                
+                if not result:
+                    self.logger.warning(f"No image found with file_hash: {file_hash}")
+                    return False
+                
+                img_id, file_path = result
+                
+                # 清理OCR文本
+                cleaned_ocr_text = self._clean_text(ocr_text)
+                
+                # 更新OCR结果
+                cursor.execute(
+                    "UPDATE image_features SET ocr_text = ?, ocr_status = 'completed', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
+                    (cleaned_ocr_text, time.time(), img_id)
+                )
+                self.conn.commit()
+                
+                self.logger.info(f"Manually set OCR result for {file_path} (file_hash: {file_hash}): '{ocr_text}'")
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Failed to set manual OCR result for file_hash {file_hash}: {e}")
+                self.conn.rollback()
                 return False
-            
-            img_id, file_path = result
-            
-            # 清理OCR文本
-            cleaned_ocr_text = self._clean_text(ocr_text)
-            
-            # 更新OCR结果
-            cursor.execute(
-                "UPDATE image_features SET ocr_text = ?, ocr_status = 'completed', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
-                (cleaned_ocr_text, time.time(), img_id)
-            )
-            self.conn.commit()
-            
-            self.logger.info(f"Manually set OCR result for {file_path} (file_hash: {file_hash}): '{ocr_text}'")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to set manual OCR result for file_hash {file_hash}: {e}")
-            self.conn.rollback()
-            return False
     
     def set_message_id_by_hash(self, file_hash: str, message_id: str) -> bool:
         """
@@ -540,40 +549,41 @@ class ImageSimilaritySearcher:
             self.logger.warning("Invalid parameters for set_message_id_by_hash")
             return False
         
-        cursor = self.conn.cursor()
-        try:
-            # 查找对应的图片记录，确保没有message_id
-            cursor.execute(
-                "SELECT id, file_path, telegram_message_id FROM image_features WHERE file_hash = ?",
-                (file_hash,)
-            )
-            result = cursor.fetchone()
-            
-            if not result:
-                self.logger.warning(f"No image found with file_hash: {file_hash}")
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                # 查找对应的图片记录，确保没有message_id
+                cursor.execute(
+                    "SELECT id, file_path, telegram_message_id FROM image_features WHERE file_hash = ?",
+                    (file_hash,)
+                )
+                result = cursor.fetchone()
+                
+                if not result:
+                    self.logger.warning(f"No image found with file_hash: {file_hash}")
+                    return False
+                
+                img_id, file_path, existing_message_id = result
+                
+                # 检查是否已有message_id
+                if existing_message_id:
+                    self.logger.warning(f"Image already has message_id: {existing_message_id}")
+                    return False
+                
+                # 更新message_id
+                cursor.execute(
+                    "UPDATE image_features SET telegram_message_id = ?, updated_time = ? WHERE id = ?",
+                    (message_id, time.time(), img_id)
+                )
+                self.conn.commit()
+                
+                self.logger.info(f"Set message_id for {file_path} (file_hash: {file_hash}): '{message_id}'")
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Failed to set message_id for file_hash {file_hash}: {e}")
+                self.conn.rollback()
                 return False
-            
-            img_id, file_path, existing_message_id = result
-            
-            # 检查是否已有message_id
-            if existing_message_id:
-                self.logger.warning(f"Image already has message_id: {existing_message_id}")
-                return False
-            
-            # 更新message_id
-            cursor.execute(
-                "UPDATE image_features SET telegram_message_id = ?, updated_time = ? WHERE id = ?",
-                (message_id, time.time(), img_id)
-            )
-            self.conn.commit()
-            
-            self.logger.info(f"Set message_id for {file_path} (file_hash: {file_hash}): '{message_id}'")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to set message_id for file_hash {file_hash}: {e}")
-            self.conn.rollback()
-            return False
 
     def clear_ocr_result(self, telegram_message_id: str) -> bool:
         """
@@ -590,35 +600,36 @@ class ImageSimilaritySearcher:
             self.logger.warning("Invalid telegram_message_id for clear_ocr_result")
             return False
         
-        cursor = self.conn.cursor()
-        try:
-            # 查找对应的图片记录
-            cursor.execute(
-                "SELECT id, file_path FROM image_features WHERE telegram_message_id = ?",
-                (telegram_message_id,)
-            )
-            result = cursor.fetchone()
-            
-            if not result:
-                self.logger.warning(f"No image found with telegram_message_id: {telegram_message_id}")
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                # 查找对应的图片记录
+                cursor.execute(
+                    "SELECT id, file_path FROM image_features WHERE telegram_message_id = ?",
+                    (telegram_message_id,)
+                )
+                result = cursor.fetchone()
+                
+                if not result:
+                    self.logger.warning(f"No image found with telegram_message_id: {telegram_message_id}")
+                    return False
+                
+                img_id, file_path = result
+                
+                # 清除OCR结果并重置状态
+                cursor.execute(
+                    "UPDATE image_features SET ocr_text = '', ocr_status = 'pending', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
+                    (time.time(), img_id)
+                )
+                self.conn.commit()
+                
+                self.logger.info(f"Cleared OCR result for {file_path} (message_id: {telegram_message_id})")
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Failed to clear OCR result for message_id {telegram_message_id}: {e}")
+                self.conn.rollback()
                 return False
-            
-            img_id, file_path = result
-            
-            # 清除OCR结果并重置状态
-            cursor.execute(
-                "UPDATE image_features SET ocr_text = '', ocr_status = 'pending', ocr_fail_count = 0, updated_time = ? WHERE id = ?",
-                (time.time(), img_id)
-            )
-            self.conn.commit()
-            
-            self.logger.info(f"Cleared OCR result for {file_path} (message_id: {telegram_message_id})")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to clear OCR result for message_id {telegram_message_id}: {e}")
-            self.conn.rollback()
-            return False
 
     def get_ocr_by_message_id(self, telegram_message_id: str) -> Optional[str]:
         """
@@ -634,24 +645,25 @@ class ImageSimilaritySearcher:
             self.logger.warning("Invalid telegram_message_id for get_ocr_by_message_id")
             return None
         
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(
-                "SELECT ocr_text FROM image_features WHERE telegram_message_id = ?",
-                (telegram_message_id,)
-            )
-            result = cursor.fetchone()
-            
-            if not result:
-                self.logger.warning(f"No image found with telegram_message_id: {telegram_message_id}")
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT ocr_text FROM image_features WHERE telegram_message_id = ?",
+                    (telegram_message_id,)
+                )
+                result = cursor.fetchone()
+                
+                if not result:
+                    self.logger.warning(f"No image found with telegram_message_id: {telegram_message_id}")
+                    return None
+                
+                ocr_text = result[0]
+                return ocr_text if ocr_text else None
+                
+            except Exception as e:
+                self.logger.error(f"Failed to get OCR result for message_id {telegram_message_id}: {e}")
                 return None
-            
-            ocr_text = result[0]
-            return ocr_text if ocr_text else None
-            
-        except Exception as e:
-            self.logger.error(f"Failed to get OCR result for message_id {telegram_message_id}: {e}")
-            return None
 
     def _hamming_distance(self, hash1: str, hash2: str) -> int:
         """计算两个哈希字符串之间的汉明距离"""
@@ -672,48 +684,49 @@ class ImageSimilaritySearcher:
             self.logger.warning(f"Could not extract features from query image: {query_image_path}")
             return []
         
-        cursor = self.conn.cursor()
-        
-        try:
-            # 1. Check for exact file hash match first (most performant check)
-            cursor.execute('SELECT file_path, telegram_message_id, file_hash, updated_time, ocr_text FROM image_features WHERE file_hash = ?', (query_features['file_hash'],))
-            exact_match = cursor.fetchone()
-            if exact_match:
-                self.logger.info(f"Exact match found for {query_image_path}: {exact_match[0]}")
-                return [{
-                    'path': exact_match[0],
-                    'telegram_message_id': exact_match[1],
-                    'file_hash': exact_match[2],
-                    'updated_time': exact_match[3],
-                    'ocr_text': exact_match[4],
-                    'similarity': 1.0
-                }]
-
-            # 2. If no exact file hash match, search for similar phash matches
-            cursor.execute('SELECT file_path, phash, telegram_message_id, file_hash, updated_time, ocr_text FROM image_features WHERE phash IS NOT NULL')
-            results = []
-            for file_path, phash, msg_id, file_hash, updated_time, ocr_text in cursor.fetchall():
-                if not phash:
-                    continue
-                distance = self._hamming_distance(query_features['phash'], phash)
-                if distance <= threshold:
-                    similarity = 1.0 - (distance / 64.0)
-                    results.append({
-                        'path': file_path,
-                        'telegram_message_id': msg_id,
-                        'file_hash': file_hash,
-                        'updated_time': updated_time,
-                        'ocr_text': ocr_text,
-                        'similarity': similarity
-                    })
+        with self._db_lock:
+            cursor = self.conn.cursor()
             
-            results.sort(key=lambda x: x['similarity'], reverse=True)
-            self.logger.info(f"Found {len(results)} similar images for {query_image_path} (threshold={threshold}).")
-            return results[:max_results]
-        
-        except Exception as e:
-            self.logger.error(f"Error during similarity search: {e}")
-            return []
+            try:
+                # 1. Check for exact file hash match first (most performant check)
+                cursor.execute('SELECT file_path, telegram_message_id, file_hash, updated_time, ocr_text FROM image_features WHERE file_hash = ?', (query_features['file_hash'],))
+                exact_match = cursor.fetchone()
+                if exact_match:
+                    self.logger.info(f"Exact match found for {query_image_path}: {exact_match[0]}")
+                    return [{
+                        'path': exact_match[0],
+                        'telegram_message_id': exact_match[1],
+                        'file_hash': exact_match[2],
+                        'updated_time': exact_match[3],
+                        'ocr_text': exact_match[4],
+                        'similarity': 1.0
+                    }]
+
+                # 2. If no exact file hash match, search for similar phash matches
+                cursor.execute('SELECT file_path, phash, telegram_message_id, file_hash, updated_time, ocr_text FROM image_features WHERE phash IS NOT NULL')
+                results = []
+                for file_path, phash, msg_id, file_hash, updated_time, ocr_text in cursor.fetchall():
+                    if not phash:
+                        continue
+                    distance = self._hamming_distance(query_features['phash'], phash)
+                    if distance <= threshold:
+                        similarity = 1.0 - (distance / 64.0)
+                        results.append({
+                            'path': file_path,
+                            'telegram_message_id': msg_id,
+                            'file_hash': file_hash,
+                            'updated_time': updated_time,
+                            'ocr_text': ocr_text,
+                            'similarity': similarity
+                        })
+                
+                results.sort(key=lambda x: x['similarity'], reverse=True)
+                self.logger.info(f"Found {len(results)} similar images for {query_image_path} (threshold={threshold}).")
+                return results[:max_results]
+            
+            except Exception as e:
+                self.logger.error(f"Error during similarity search: {e}")
+                return []
 
     def search_by_text(self, keywords: str, max_results: int = 3, search_mode: str = 'smart') -> List[Dict]:
         """
@@ -730,33 +743,34 @@ class ImageSimilaritySearcher:
                 - 'fts': 仅使用FTS5搜索
                 - 'like': 仅使用LIKE搜索
         """
-        cursor = self.conn.cursor()
-        try:
-            # 清理和规范化查询文本
-            cleaned_keywords = self._normalize_query_text(keywords)
-            if not cleaned_keywords:
-                self.logger.warning(f"Query keywords empty after cleaning: '{keywords}'")
-                return []
-            
-            # 对清理后的关键字进行分词
-            query_tokens = self._tokenize_text(cleaned_keywords)
-            
-            if search_mode == 'comprehensive':
-                # 全面搜索模式：合并FTS5和LIKE结果
-                return self._comprehensive_search(cursor, query_tokens, cleaned_keywords, max_results)
-            elif search_mode == 'fts':
-                # 仅FTS5搜索
-                return self._fts_search_only(cursor, query_tokens, max_results)
-            elif search_mode == 'like':
-                # 仅LIKE搜索
-                return self._like_search_only(cursor, query_tokens, cleaned_keywords, max_results)
-            else:
-                # 默认智能搜索模式
-                return self._smart_search(cursor, query_tokens, cleaned_keywords, max_results)
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                # 清理和规范化查询文本
+                cleaned_keywords = self._normalize_query_text(keywords)
+                if not cleaned_keywords:
+                    self.logger.warning(f"Query keywords empty after cleaning: '{keywords}'")
+                    return []
                 
-        except Exception as e:
-            self.logger.error(f"Error during text search: {e}")
-            return []
+                # 对清理后的关键字进行分词
+                query_tokens = self._tokenize_text(cleaned_keywords)
+                
+                if search_mode == 'comprehensive':
+                    # 全面搜索模式：合并FTS5和LIKE结果
+                    return self._comprehensive_search(cursor, query_tokens, cleaned_keywords, max_results)
+                elif search_mode == 'fts':
+                    # 仅FTS5搜索
+                    return self._fts_search_only(cursor, query_tokens, max_results)
+                elif search_mode == 'like':
+                    # 仅LIKE搜索
+                    return self._like_search_only(cursor, query_tokens, cleaned_keywords, max_results)
+                else:
+                    # 默认智能搜索模式
+                    return self._smart_search(cursor, query_tokens, cleaned_keywords, max_results)
+                    
+            except Exception as e:
+                self.logger.error(f"Error during text search: {e}")
+                return []
     
     def _comprehensive_search(self, cursor, query_tokens: List[str], cleaned_keywords: str, max_results: int) -> List[Dict]:
         """全面搜索：合并FTS5和LIKE结果"""
@@ -867,71 +881,73 @@ class ImageSimilaritySearcher:
         if not path_mappings:
             return
 
-        cursor = self.conn.cursor()
-        try:
-            # Use executemany for efficient bulk updates
-            cursor.executemany(
-                "UPDATE image_features SET file_path = ? WHERE file_path = ?",
-                [(new_path, old_path) for old_path, new_path in path_mappings]
-            )
-            self.conn.commit()
-            self.logger.info(f"Successfully updated {len(path_mappings)} file paths in database after archiving.")
-        except Exception as e:
-            self.logger.error(f"Failed to update file paths in database during archiving: {e}")
-            self.conn.rollback()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                # Use executemany for efficient bulk updates
+                cursor.executemany(
+                    "UPDATE image_features SET file_path = ? WHERE file_path = ?",
+                    [(new_path, old_path) for old_path, new_path in path_mappings]
+                )
+                self.conn.commit()
+                self.logger.info(f"Successfully updated {len(path_mappings)} file paths in database after archiving.")
+            except Exception as e:
+                self.logger.error(f"Failed to update file paths in database during archiving: {e}")
+                self.conn.rollback()
 
     def clean_all_ocr_texts(self) -> Dict[str, int]:
         """
         批量清理数据库中所有已完成OCR的文本，移除噪声字符。
         返回处理统计信息。
         """
-        cursor = self.conn.cursor()
-        stats = {'total': 0, 'cleaned': 0, 'unchanged': 0, 'errors': 0}
-        
-        try:
-            # 获取所有已完成OCR的记录
-            cursor.execute(
-                "SELECT id, file_path, ocr_text FROM image_features WHERE ocr_status = 'completed' AND ocr_text IS NOT NULL AND ocr_text != ''"
-            )
-            records = cursor.fetchall()
-            stats['total'] = len(records)
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            stats = {'total': 0, 'cleaned': 0, 'unchanged': 0, 'errors': 0}
             
-            self.logger.info(f"Starting OCR text cleaning for {stats['total']} records...")
-            
-            for img_id, file_path, original_text in records:
-                try:
-                    if not original_text:
-                        stats['unchanged'] += 1
-                        continue
-                    
-                    cleaned_text = self._clean_text(original_text)
-                    
-                    if cleaned_text != original_text:
-                        # 更新清理后的文本
-                        cursor.execute(
-                            "UPDATE image_features SET ocr_text = ?, updated_time = ? WHERE id = ?",
-                            (cleaned_text, time.time(), img_id)
-                        )
-                        stats['cleaned'] += 1
-                        self.logger.debug(f"Cleaned OCR text for {file_path}: '{original_text}' -> '{cleaned_text}'")
-                    else:
-                        stats['unchanged'] += 1
+            try:
+                # 获取所有已完成OCR的记录
+                cursor.execute(
+                    "SELECT id, file_path, ocr_text FROM image_features WHERE ocr_status = 'completed' AND ocr_text IS NOT NULL AND ocr_text != ''"
+                )
+                records = cursor.fetchall()
+                stats['total'] = len(records)
+                
+                self.logger.info(f"Starting OCR text cleaning for {stats['total']} records...")
+                
+                for img_id, file_path, original_text in records:
+                    try:
+                        if not original_text:
+                            stats['unchanged'] += 1
+                            continue
                         
-                except Exception as e:
-                    self.logger.error(f"Error cleaning OCR text for image id {img_id}: {e}")
-                    stats['errors'] += 1
-            
-            # 提交所有更改
-            self.conn.commit()
-            
-            self.logger.info(f"OCR text cleaning completed: {stats}")
-            return stats
-            
-        except Exception as e:
-            self.logger.error(f"Error during batch OCR text cleaning: {e}")
-            self.conn.rollback()
-            stats['errors'] = stats['total']
-            return stats
+                        cleaned_text = self._clean_text(original_text)
+                        
+                        if cleaned_text != original_text:
+                            # 更新清理后的文本
+                            cursor.execute(
+                                "UPDATE image_features SET ocr_text = ?, updated_time = ? WHERE id = ?",
+                                (cleaned_text, time.time(), img_id)
+                            )
+                            stats['cleaned'] += 1
+                            self.logger.debug(f"Cleaned OCR text for {file_path}: '{original_text}' -> '{cleaned_text}'")
+                        else:
+                            stats['unchanged'] += 1
+                            
+                    except Exception as e:
+                        self.logger.error(f"Error cleaning OCR text for image id {img_id}: {e}")
+                        stats['errors'] += 1
+                
+                # 提交所有更改
+                self.conn.commit()
+                
+                self.logger.info(f"OCR text cleaning completed: {stats}")
+                return stats
+                
+            except Exception as e:
+                self.logger.error(f"Error during batch OCR text cleaning: {e}")
+                self.conn.rollback()
+                stats['errors'] = stats['total']
+                return stats
 
     def cleanup_ocr_resources(self):
         """清理OCR引擎占用的内存资源"""

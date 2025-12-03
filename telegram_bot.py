@@ -2,6 +2,8 @@ import logging
 import os
 import shutil
 import glob
+import signal
+import sys
 from uuid import uuid4
 from datetime import datetime, time
 import asyncio
@@ -357,14 +359,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     现在包含重试机制：如果处理失败，会自动重试，重试次数与OCR配置保持一致。
     """
-    if update.message.from_user.id != ALLOWED_USER_ID:
-        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact.")
-        return
+    try:
+        logger.info(f"📸 Received photo from user {update.message.from_user.id}, message_id: {update.message.message_id}")
+        
+        if update.message.from_user.id != ALLOWED_USER_ID:
+            logger.warning(f"❌ Unauthorized user {update.message.from_user.id} tried to interact.")
+            return
 
-    await update.message.reply_text("处理中...")
-    
-    # 调用带重试机制的处理函数
-    await handle_photo_with_retry(update, context)
+        logger.info(f"✅ User authorized, sending processing message...")
+        await update.message.reply_text("处理中...")
+        
+        # 调用带重试机制的处理函数
+        logger.info(f"🔄 Starting photo processing with retry mechanism...")
+        await handle_photo_with_retry(update, context)
+        logger.info(f"✅ Photo processing completed for message_id: {update.message.message_id}")
+    except Exception as e:
+        logger.error(f"❌ Critical error in handle_photo: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"处理图片时发生严重错误: {str(e)}")
+        except:
+            pass
 
 
 
@@ -477,8 +491,10 @@ async def search_by_image(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 /find 命令 (文本或图片搜索)"""
+    logger.info(f"🔍 Received /find command from user {update.message.from_user.id}")
+    
     if update.message.from_user.id != ALLOWED_USER_ID:
-        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /search.")
+        logger.warning(f"❌ Unauthorized user {update.message.from_user.id} tried to interact with /find.")
         return
 
     # Mode 1: Reply to a photo to search by image
@@ -701,8 +717,10 @@ async def ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     import gc
     
+    logger.info(f"🔤 Received /ocr command from user {update.message.from_user.id}")
+    
     if update.message.from_user.id != ALLOWED_USER_ID:
-        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /forceOCR.")
+        logger.warning(f"❌ Unauthorized user {update.message.from_user.id} tried to interact with /ocr.")
         return
     
     pending_count = searcher.get_pending_ocr_count()
@@ -848,8 +866,10 @@ async def tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     命令用法：回复一张图片并发送 "/tag 文本内容"
     例如：/tag 猫 薛条 可爱
     """
+    logger.info(f"🏷️ Received /tag command from user {update.message.from_user.id}")
+    
     if update.message.from_user.id != ALLOWED_USER_ID:
-        logger.warning(f"Unauthorized user {update.message.from_user.id} tried to interact with /setocr.")
+        logger.warning(f"❌ Unauthorized user {update.message.from_user.id} tried to interact with /tag.")
         return
     
     # 检查是否回复了一个消息
@@ -1472,7 +1492,23 @@ def parse_scheduled_time(time_str: str) -> Optional[time]:
         return None
 
 
+def signal_handler(signum, frame):
+    """
+    信号处理函数，用于优雅退出
+    
+    Args:
+        signum: 信号编号
+        frame: 当前栈帧
+    """
+    logger.info(f"收到信号 {signum}，正在关闭机器人...")
+    sys.exit(0)
+
+
 if __name__ == '__main__':
+    # 注册信号处理器
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)  # 同时处理Ctrl+C
+    
     logger.info("Starting bot...")
     
     application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -1487,39 +1523,20 @@ if __name__ == '__main__':
     # handle_photo processes all photo messages, internal logic decides add or search
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
-    # Add scheduled OCR task with enhanced configuration
+    # Add scheduled OCR task
     # 注意：定时任务使用北京时间(UTC+8)配置，实际调度时间会自动转换为UTC
     scheduled_ocr_time = parse_scheduled_time(OCR_SCHEDULED_TIME)
     if scheduled_ocr_time:
         job_queue = application.job_queue
         
-        # 配置调度器参数
-        try:
-            # 添加定时任务，带有增强的配置
-            job = job_queue.run_daily(
-                scheduled_ocr_task, 
-                time=scheduled_ocr_time,
-                name="daily_ocr_task",  # 给任务命名
-                job_kwargs={
-                    'misfire_grace_time': SCHEDULER_MISFIRE_GRACE_TIME,  # 延迟容忍时间
-                    'max_instances': SCHEDULER_MAX_INSTANCES,            # 最大并发实例
-                    'coalesce': SCHEDULER_COALESCE                       # 合并延迟任务
-                }
-            )
-            
-            logger.info(f"Scheduled daily OCR task at Beijing time {OCR_SCHEDULED_TIME} (UTC {scheduled_ocr_time.strftime('%H:%M')})")
-            logger.info(f"Task configuration: misfire_grace_time={SCHEDULER_MISFIRE_GRACE_TIME}s, max_instances={SCHEDULER_MAX_INSTANCES}, coalesce={SCHEDULER_COALESCE}")
-            
-            # 记录下一次执行时间
-            next_run = job.next_run_time
-            if next_run:
-                logger.info(f"Next OCR task scheduled for: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-            
-        except Exception as e:
-            logger.error(f"Failed to configure scheduled OCR task: {e}")
-            # 回退到简单配置
-            job_queue.run_daily(scheduled_ocr_task, time=scheduled_ocr_time)
-            logger.warning("Using fallback scheduler configuration")
+        # 添加定时任务（只注册一次）
+        job = job_queue.run_daily(
+            scheduled_ocr_task, 
+            time=scheduled_ocr_time,
+            name="daily_ocr_task"  # 给任务命名，防止重复注册
+        )
+        
+        logger.info(f"✅ Scheduled daily OCR task at Beijing time {OCR_SCHEDULED_TIME} (UTC {scheduled_ocr_time.strftime('%H:%M')})")
     else:
         logger.warning(f"Failed to parse OCR scheduled time: {OCR_SCHEDULED_TIME}")
     
