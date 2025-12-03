@@ -1511,7 +1511,32 @@ if __name__ == '__main__':
     
     logger.info("Starting bot...")
     
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    # 配置连接池参数，解决连接池耗尽问题
+    from telegram.ext import ApplicationBuilder
+    from telegram.request import HTTPXRequest
+    
+    # 创建自定义请求对象，增大连接池和超时时间
+    request = HTTPXRequest(
+        connection_pool_size=20,       # 增大连接池（默认1）
+        read_timeout=30.0,             # 读取超时（秒）
+        write_timeout=30.0,            # 写入超时（秒）
+        connect_timeout=30.0,          # 连接超时（秒）
+        pool_timeout=10.0,             # 连接池等待超时（秒）
+    )
+    
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .get_updates_request(HTTPXRequest(
+            connection_pool_size=10,   # get_updates 专用连接池
+            read_timeout=30.0,
+            write_timeout=30.0,
+            connect_timeout=30.0,
+            pool_timeout=10.0,
+        ))
+        .build()
+    )
     
     # Add handlers - 新命令体系，首字母即可区分
     application.add_handler(CommandHandler('find', find_command))      # 搜索（替代search）

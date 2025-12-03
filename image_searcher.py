@@ -7,13 +7,29 @@ import logging
 import re
 import gc
 import threading
+import subprocess
+import platform
 
 from PIL import Image
 import imagehash
 import jieba
 import opencc
 
-from paddleocr import PaddleOCR
+# 尝试导入配置
+try:
+    import config
+    MAC_SHORTCUTS = getattr(config, 'MAC_SHORTCUTS', None)
+    OCR_POST_FILTER_PATTERNS = getattr(config, 'OCR_POST_FILTER_PATTERNS', [])
+except ImportError:
+    MAC_SHORTCUTS = None
+    OCR_POST_FILTER_PATTERNS = []
+
+# 根据配置决定是否导入 PaddleOCR
+# 只有在非 Mac 或未配置快捷指令时才需要 PaddleOCR
+if not MAC_SHORTCUTS or platform.system() != 'Darwin':
+    from paddleocr import PaddleOCR
+else:
+    PaddleOCR = None
 
 class ImageSimilaritySearcher:
     """图像相似性搜索器 - Bot专用版"""
@@ -48,14 +64,150 @@ class ImageSimilaritySearcher:
 
     def _ensure_ocr_engine(self):
         """确保OCR引擎已加载（懒加载模式）"""
+        # 如果使用 Mac 快捷指令，则不需要 PaddleOCR
+        if self._use_mac_shortcuts():
+            return
+        
         if self.ocr_engine is None:
             try:
                 self.logger.info("Loading OCR engine on demand...")
+                if PaddleOCR is None:
+                    raise RuntimeError("PaddleOCR is not available")
                 self.ocr_engine = PaddleOCR()
                 self.logger.info("OCR engine loaded successfully")
             except Exception as e:
                 self.logger.error(f"Failed to load OCR engine: {e}")
                 raise
+    
+    def _use_mac_shortcuts(self) -> bool:
+        """判断是否使用 Mac 快捷指令进行 OCR"""
+        return bool(MAC_SHORTCUTS) and platform.system() == 'Darwin'
+    
+    def _get_clipboard_content(self) -> str:
+        """
+        获取 Mac 剪切板内容
+        
+        Returns:
+            剪切板内容字符串
+        """
+        try:
+            result = subprocess.run(
+                ['pbpaste'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            return result.stdout
+        except Exception as e:
+            self.logger.warning(f"Failed to get clipboard content: {e}")
+            return ""
+    
+    def _post_process_ocr_text(self, text_lines: List[str]) -> List[str]:
+        """
+        OCR后处理：去重、过滤空行、只有数字的行、只有符号的行等
+        
+        Args:
+            text_lines: 文本行列表
+        
+        Returns:
+            处理后的文本行列表
+        """
+        if not text_lines:
+            return []
+        
+        # 编译正则表达式
+        compiled_patterns = [re.compile(pattern) for pattern in OCR_POST_FILTER_PATTERNS]
+        
+        seen = set()
+        result = []
+        
+        for line in text_lines:
+            # 去除首尾空白
+            line = line.strip()
+            
+            # 跳过空行
+            if not line:
+                continue
+            
+            # 去重
+            if line in seen:
+                continue
+            
+            # 检查是否匹配任何过滤正则
+            should_filter = False
+            for pattern in compiled_patterns:
+                if pattern.match(line):
+                    should_filter = True
+                    break
+            
+            if should_filter:
+                continue
+            
+            seen.add(line)
+            result.append(line)
+        
+        return result
+    
+    def _extract_text_mac_shortcuts(self, image_path: str, timeout: int = 30) -> str:
+        """
+        使用 Mac 快捷指令进行 OCR 识别
+        
+        Args:
+            image_path: 图片路径
+            timeout: 超时时间（秒）
+        
+        Returns:
+            识别结果文本
+        """
+        if not os.path.exists(image_path):
+            self.logger.error(f"Image file not found: {image_path}")
+            return ""
+        
+        # 获取绝对路径
+        abs_path = os.path.abspath(image_path)
+        
+        # 获取执行前的剪切板内容
+        old_clipboard = self._get_clipboard_content()
+        
+        try:
+            # 调用快捷指令
+            self.logger.info(f"Running Mac shortcut '{MAC_SHORTCUTS}' for {abs_path}")
+            subprocess.run(
+                ['shortcuts', 'run', MAC_SHORTCUTS, '-i', abs_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            
+            # 监听剪切板变化
+            start_time = time.time()
+            poll_interval = 0.3  # 轮询间隔
+            
+            while time.time() - start_time < timeout:
+                current_clipboard = self._get_clipboard_content()
+                if current_clipboard != old_clipboard:
+                    # 剪切板内容变化，说明 OCR 完成
+                    text_lines = current_clipboard.split('\n')
+                    processed_lines = self._post_process_ocr_text(text_lines)
+                    result_text = ' '.join(processed_lines)
+                    # 清理文本
+                    cleaned_text = self._clean_text(result_text)
+                    self.logger.info(f"Mac shortcuts OCR completed for {abs_path}: {len(cleaned_text)} chars")
+                    return cleaned_text
+                time.sleep(poll_interval)
+            
+            self.logger.warning(f"Mac shortcuts OCR timeout for {abs_path}")
+            return ""
+            
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"Mac shortcut execution timeout ({timeout}s) for {abs_path}")
+            return ""
+        except FileNotFoundError:
+            self.logger.error("'shortcuts' command not found. Make sure running on macOS.")
+            return ""
+        except Exception as e:
+            self.logger.error(f"Mac shortcuts OCR failed for {abs_path}: {e}")
+            return ""
 
     def _clean_text(self, text: str) -> str:
         """
@@ -142,7 +294,11 @@ class ImageSimilaritySearcher:
             raise
 
     def _extract_text_from_image(self, image_path: str) -> str:
-        """使用PaddleOCR从图片中提取文本（懒加载模式）"""
+        """从图片中提取文本，根据配置选择 Mac 快捷指令或 PaddleOCR"""
+        # 检查是否使用 Mac 快捷指令
+        if self._use_mac_shortcuts():
+            return self._extract_text_mac_shortcuts(image_path)
+        
         # 懒加载：在实际需要OCR时才加载引擎
         self._ensure_ocr_engine()
         
@@ -339,8 +495,9 @@ class ImageSimilaritySearcher:
             
             self.logger.info(f"Processing {len(pending_images)} images for OCR...")
             
-            # 在处理前确保OCR引擎已加载
-            self._ensure_ocr_engine()
+            # 如果不使用 Mac 快捷指令，在处理前确保OCR引擎已加载
+            if not self._use_mac_shortcuts():
+                self._ensure_ocr_engine()
             
             for img_id, file_path in pending_images:
                 if not os.path.exists(file_path):
@@ -951,6 +1108,10 @@ class ImageSimilaritySearcher:
 
     def cleanup_ocr_resources(self):
         """清理OCR引擎占用的内存资源"""
+        # 如果使用 Mac 快捷指令，不需要清理 PaddleOCR 资源
+        if self._use_mac_shortcuts():
+            return
+        
         try:
             if hasattr(self, 'ocr_engine') and self.ocr_engine is not None:
                 # 尝试清理PaddleOCR的内部资源
