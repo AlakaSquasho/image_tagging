@@ -22,7 +22,8 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 
 from config import (BOT_TOKEN, ALLOWED_USER_ID, IMAGE_DOWNLOAD_PATH, DB_PATH, LOG_FILE_PATH, 
                    MAX_IMAGES_IN_DOWNLOAD_FOLDER, OCR_SCHEDULED_TIME, OCR_MAX_RETRIES, OCR_BATCH_SIZE, 
-                   MAX_RESULTS, SCHEDULER_MISFIRE_GRACE_TIME, SCHEDULER_MAX_INSTANCES, SCHEDULER_COALESCE)
+                   MAX_RESULTS, SCHEDULER_MISFIRE_GRACE_TIME, SCHEDULER_MAX_INSTANCES, SCHEDULER_COALESCE,
+                   FAILED_OCR_DEFAULT_LIMIT)
 from image_searcher import ImageSimilaritySearcher
 
 from typing import Dict, Optional, List
@@ -1356,6 +1357,137 @@ async def getocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def failed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    处理 /failed 命令，获取OCR失败的记录列表。
+    通过回复历史消息的方式显示，用户点击引用即可跳转到对应图片。
+    
+    用法：
+    - /failed          显示默认数量的失败记录
+    - /failed -5       显示前5条失败记录
+    - /failed -a       显示所有失败记录
+    - /failed -all     显示所有失败记录
+    """
+    logger.info(f"📋 Received /failed command from user {update.message.from_user.id}")
+    
+    if update.message.from_user.id != ALLOWED_USER_ID:
+        logger.warning(f"❌ Unauthorized user {update.message.from_user.id} tried to interact with /failed.")
+        return
+    
+    # 解析参数
+    limit = FAILED_OCR_DEFAULT_LIMIT  # 默认值
+    show_all = False
+    
+    if context.args:
+        arg = context.args[0].lower()
+        if arg in ['-a', '-all', '--all']:
+            show_all = True
+            limit = None
+        elif arg.startswith('-') and arg[1:].isdigit():
+            limit = int(arg[1:])
+        elif arg.isdigit():
+            limit = int(arg)
+    
+    # 获取失败记录总数
+    failed_count = searcher.get_failed_ocr_count()
+    
+    if failed_count == 0:
+        await update.message.reply_text(
+            "✅ 当前没有OCR失败的记录。",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 获取失败记录
+    records = searcher.get_failed_ocr_records(limit=limit if not show_all else None)
+    
+    if not records:
+        await update.message.reply_text(
+            "✅ 当前没有OCR失败的记录。",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    
+    # 先发送概要信息
+    if show_all:
+        summary = f"📋 OCR失败记录（全部 {len(records)} 条）\n\n以下将逐条显示，点击引用可跳转到对应图片："
+    else:
+        summary = f"📋 OCR失败记录（显示 {len(records)}/{failed_count} 条）\n\n以下将逐条显示，点击引用可跳转到对应图片："
+    
+    await update.message.reply_text(
+        summary,
+        reply_to_message_id=update.message.message_id
+    )
+    
+    # 逐条发送，通过回复历史消息的方式
+    sent_count = 0
+    skipped_count = 0
+    
+    for idx, record in enumerate(records, 1):
+        file_name = os.path.basename(record['file_path'])
+        fail_count = record['ocr_fail_count']
+        
+        # 从文件名中提取消息ID（格式: {message_id}_{file_unique_id}.{ext}）
+        msg_id_from_filename = None
+        if '_' in file_name:
+            parts = file_name.split('_')
+            if parts[0].isdigit():
+                msg_id_from_filename = int(parts[0])
+        
+        # 更新时间格式化
+        update_time = ""
+        if record['updated_time']:
+            update_time = datetime.fromtimestamp(record['updated_time']).strftime('%m-%d %H:%M')
+        
+        # 构建消息内容
+        message_text = (
+            f"⚠️ 失败记录 #{idx}\n"
+            f"失败次数: {fail_count}\n"
+            f"更新时间: {update_time}\n"
+            f"💡 回复此图片使用 /tag 设置标签"
+        )
+        
+        if msg_id_from_filename:
+            try:
+                # 通过回复历史消息发送，用户点击引用即可跳转
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=message_text,
+                    reply_to_message_id=msg_id_from_filename
+                )
+                sent_count += 1
+                
+                # 添加短暂延迟，避免发送过快被限流
+                if idx < len(records):
+                    await asyncio.sleep(0.3)
+                    
+            except Exception as e:
+                # 如果回复失败（比如原消息已被删除），记录跳过
+                logger.warning(f"Failed to reply to message {msg_id_from_filename}: {e}")
+                skipped_count += 1
+        else:
+            # 没有消息ID，直接发送文件名信息
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ 失败记录 #{idx}\n文件: `{file_name}`\n失败次数: {fail_count}\n更新时间: {update_time}\n⚠️ 无法定位原消息",
+                parse_mode='Markdown'
+            )
+            sent_count += 1
+            skipped_count += 1
+    
+    # 发送完成统计
+    complete_msg = f"✅ 已显示 {sent_count} 条失败记录"
+    if skipped_count > 0:
+        complete_msg += f"\n⚠️ {skipped_count} 条无法定位原消息"
+    if not show_all and failed_count > len(records):
+        complete_msg += f"\n📌 使用 /failed -a 查看全部 {failed_count} 条记录"
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=complete_msg
+    )
+
+
 async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
     """
     定时执行OCR任务 - 处理所有待处理的图片
@@ -1545,6 +1677,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler('untag', untag_command))    # 清除标签（替代clearocr）
     application.add_handler(CommandHandler('link', setmessageid_command))  # 设置消息ID（新命令）
     application.add_handler(CommandHandler('getocr', getocr_command))  # 查询OCR结果（新命令）
+    application.add_handler(CommandHandler('failed', failed_command))  # 查询OCR失败记录（新命令）
     # handle_photo processes all photo messages, internal logic decides add or search
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     

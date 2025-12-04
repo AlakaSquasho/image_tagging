@@ -43,3 +43,6 @@ SCHEDULER_COALESCE = True            # 合并延迟的任务执行，避免积�
 
 # -- 搜索配置 --
 MAX_RESULTS = 5               # 搜索返回的最大结果数量（适用于图片搜索和文本搜索）
+
+# -- 失败记录配置 --
+FAILED_OCR_DEFAULT_LIMIT = 5  # /failed 命令默认显示的失败记录数量

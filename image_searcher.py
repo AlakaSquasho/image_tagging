@@ -148,7 +148,7 @@ class ImageSimilaritySearcher:
         
         return result
     
-    def _extract_text_mac_shortcuts(self, image_path: str, timeout: int = 30) -> str:
+    def _extract_text_mac_shortcuts(self, image_path: str, timeout: int = 3) -> str:
         """
         使用 Mac 快捷指令进行 OCR 识别
         
@@ -516,11 +516,27 @@ class ImageSimilaritySearcher:
                         stats['skipped'] += 1
                         continue
                     
+                    # 获取当前数据库中的 OCR 文本
+                    db_ocr_text = self._get_ocr_text_by_id(img_id)
+                    
                     self.logger.debug(f"Processing OCR for {file_path} (id: {img_id})...")
                     ocr_text = self._extract_text_from_image(file_path)
-                    self._update_ocr_result(img_id, ocr_text, 'completed', 0)
-                    stats['succeeded'] += 1
-                    self.logger.info(f"Successfully processed OCR for {file_path}")
+                    
+                    if ocr_text and not db_ocr_text:
+                        # 识别结果不为空且数据库中无内容，更新数据库
+                        self._update_ocr_result(img_id, ocr_text, 'completed', 0)
+                        stats['succeeded'] += 1
+                        self.logger.info(f"Successfully processed OCR for {file_path}")
+                    elif db_ocr_text:
+                        # 识别结果为空，但数据库有内容，跳过（保留原有内容）
+                        self._update_ocr_result(img_id, db_ocr_text, 'completed', 0)
+                        stats['skipped'] += 1
+                        self.logger.info(f"Skipped OCR for {file_path}: keeping existing text ({len(db_ocr_text)} chars)")
+                    else:
+                        # 识别结果为空且数据库也为空，标记为失败
+                        self._increment_ocr_fail_count(img_id)
+                        stats['failed'] += 1
+                        self.logger.warning(f"OCR result empty for {file_path}, marked as failed")
                 except Exception as e:
                     self.logger.error(f"OCR failed for {file_path}: {e}", exc_info=True)
                     self._increment_ocr_fail_count(img_id)
@@ -536,6 +552,20 @@ class ImageSimilaritySearcher:
             self.cleanup_ocr_resources()
             # 每批处理完成后显式触发垃圾回收
             gc.collect()
+
+    def _get_ocr_text_by_id(self, img_id: int) -> Optional[str]:
+        """通过 ID 获取图片的 OCR 文本"""
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT ocr_text FROM image_features WHERE id = ?", (img_id,))
+                result = cursor.fetchone()
+                if result and result[0]:
+                    return result[0]
+                return None
+            except Exception as e:
+                self.logger.error(f"Failed to get OCR text for id {img_id}: {e}")
+                return None
 
     def _update_ocr_result(self, img_id: int, ocr_text: str, status: str, fail_count: int):
         """更新OCR结果"""
@@ -590,6 +620,66 @@ class ImageSimilaritySearcher:
             except Exception as e:
                 self.logger.error(f"Failed to get pending OCR count: {e}")
                 return 0
+
+    def get_failed_ocr_count(self) -> int:
+        """获取OCR失败的图片数量"""
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT COUNT(*) FROM image_features WHERE ocr_status = 'failed'")
+                count = cursor.fetchone()[0]
+                return count
+            except Exception as e:
+                self.logger.error(f"Failed to get failed OCR count: {e}")
+                return 0
+
+    def get_failed_ocr_records(self, limit: Optional[int] = None) -> List[Dict]:
+        """
+        获取OCR失败的记录列表
+        
+        Args:
+            limit: 返回的最大记录数，None 表示返回所有记录
+        
+        Returns:
+            包含失败记录信息的字典列表，每个字典包含:
+            - id: 数据库ID
+            - file_path: 文件路径
+            - telegram_message_id: Telegram消息ID（可能为空）
+            - ocr_fail_count: 失败次数
+            - updated_time: 更新时间
+        """
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                if limit is not None:
+                    cursor.execute('''
+                        SELECT id, file_path, telegram_message_id, ocr_fail_count, updated_time
+                        FROM image_features 
+                        WHERE ocr_status = 'failed'
+                        ORDER BY updated_time DESC
+                        LIMIT ?
+                    ''', (limit,))
+                else:
+                    cursor.execute('''
+                        SELECT id, file_path, telegram_message_id, ocr_fail_count, updated_time
+                        FROM image_features 
+                        WHERE ocr_status = 'failed'
+                        ORDER BY updated_time DESC
+                    ''')
+                
+                results = []
+                for row in cursor.fetchall():
+                    results.append({
+                        'id': row[0],
+                        'file_path': row[1],
+                        'telegram_message_id': row[2],
+                        'ocr_fail_count': row[3],
+                        'updated_time': row[4]
+                    })
+                return results
+            except Exception as e:
+                self.logger.error(f"Failed to get failed OCR records: {e}")
+                return []
 
     def set_manual_ocr_result(self, telegram_message_id: str, ocr_text: str) -> bool:
         """
