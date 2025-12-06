@@ -954,12 +954,15 @@ async def tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if success:
                 pending_count = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
                 msg_info = f"消息ID: {telegram_message_id_in_db}" if telegram_message_id_in_db else "(无消息ID)"
+                # 使用 HTML 格式避免 Markdown 特殊字符解析问题
+                import html
+                escaped_ocr_text = html.escape(ocr_text)
                 await update.message.reply_text(
                     f"✅ OCR结果已成功设置。\n\n"
-                    f"OCR内容: `{ocr_text}`\n"
+                    f"OCR内容: <code>{escaped_ocr_text}</code>\n"
                     f"{msg_info}\n"
                     f"当前待处理OCR图片数: {pending_count}",
-                    parse_mode='Markdown',
+                    parse_mode='HTML',
                     reply_to_message_id=update.message.message_id
                 )
                 logger.info(f"User manually set OCR result for file_hash {file_hash}: '{ocr_text}'")
