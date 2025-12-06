@@ -609,12 +609,21 @@ class ImageSimilaritySearcher:
                 self.logger.error(f"Failed to mark image as skipped for id {img_id}: {e}")
                 self.conn.rollback()
 
-    def get_pending_ocr_count(self) -> int:
-        """获取待处理的OCR图片数量"""
+    def get_pending_ocr_count(self, max_retries: int = 3) -> int:
+        """
+        获取待处理的OCR图片数量（包括pending和可重试的failed）
+        
+        Args:
+            max_retries: 最大重试次数，与 process_ocr_pending_images 保持一致
+        """
         with self._db_lock:
             cursor = self.conn.cursor()
             try:
-                cursor.execute("SELECT COUNT(*) FROM image_features WHERE ocr_status = 'pending'")
+                # 统计逻辑与 process_ocr_pending_images 保持一致
+                cursor.execute('''
+                    SELECT COUNT(*) FROM image_features 
+                    WHERE (ocr_status = 'pending' OR (ocr_status = 'failed' AND ocr_fail_count < ?))
+                ''', (max_retries,))
                 count = cursor.fetchone()[0]
                 return count
             except Exception as e:

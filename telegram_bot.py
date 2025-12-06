@@ -304,7 +304,7 @@ async def handle_photo_with_retry(update: Update, context: ContextTypes.DEFAULT_
                     # OCR will be processed later by scheduled task
                     index_success = searcher.add_image_to_index(permanent_path, telegram_msg_id_for_db)
                     if index_success:
-                        pending_count = searcher.get_pending_ocr_count()
+                        pending_count = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
                         await update.message.reply_text(f"该图片已成功建立索引。\nOCR处理将在定时任务中进行。\n当前待处理OCR图片数: {pending_count}", 
                                                         reply_to_message_id=current_message_id, parse_mode='Markdown')
                     else:
@@ -724,7 +724,7 @@ async def ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"❌ Unauthorized user {update.message.from_user.id} tried to interact with /ocr.")
         return
     
-    pending_count = searcher.get_pending_ocr_count()
+    pending_count = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
     if pending_count == 0:
         await update.message.reply_text("没有待处理的OCR图片。")
         return
@@ -746,7 +746,7 @@ async def ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         while iteration < max_iterations:
             iteration += 1
-            remaining = searcher.get_pending_ocr_count()
+            remaining = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
             if remaining == 0:
                 logger.info(f"Force OCR: All images processed after {iteration} iterations.")
                 break
@@ -952,7 +952,7 @@ async def tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success = searcher.set_manual_ocr_result_by_hash(file_hash, ocr_text)
             
             if success:
-                pending_count = searcher.get_pending_ocr_count()
+                pending_count = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
                 msg_info = f"消息ID: {telegram_message_id_in_db}" if telegram_message_id_in_db else "(无消息ID)"
                 await update.message.reply_text(
                     f"✅ OCR结果已成功设置。\n\n"
@@ -1181,7 +1181,7 @@ async def untag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success = searcher.clear_ocr_result(telegram_message_id_in_db)
             
             if success:
-                pending_count = searcher.get_pending_ocr_count()
+                pending_count = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
                 await update.message.reply_text(
                     f"✅ OCR结果已成功清除。\n\n"
                     f"该图片的OCR状态已重置为pending。\n"
@@ -1501,7 +1501,7 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Scheduled OCR task started at: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     try:
-        pending_count = searcher.get_pending_ocr_count()
+        pending_count = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
         if pending_count == 0:
             logger.info("Scheduled OCR task: No pending images.")
             await context.bot.send_message(
@@ -1518,7 +1518,7 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
         
         while True:
             iteration += 1
-            remaining = searcher.get_pending_ocr_count()
+            remaining = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
             if remaining == 0:
                 logger.info(f"All pending images have been processed after {iteration} iterations.")
                 break
