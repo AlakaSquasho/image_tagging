@@ -534,7 +534,7 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.args:
         try:
             # 解析搜索参数
-            search_mode = 'smart'  # 默认模式
+            search_mode = 'exact'  # 默认模式：精确匹配（不分词）
             max_results = MAX_RESULTS  # 默认结果数
             keywords_args = list(context.args)
             
@@ -547,14 +547,14 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # 支持 --com 作为 --comprehensive 的别名
                     if param == 'com':
                         param = 'comprehensive'
-                    if param in ['smart', 'comprehensive', 'fts', 'like']:
+                    if param in ['exact', 'comprehensive', 'contains']:
                         search_mode = param
                         keywords_args.pop(i)
                         continue
                     else:
                         await update.message.reply_text(
                             f"无效的搜索模式: {arg}\n"
-                            f"支持的模式: --smart, --comprehensive (--com), --fts, --like",
+                            f"支持的模式: --exact (默认), --comprehensive (--com), --contains",
                             reply_to_message_id=update.message.message_id
                         )
                         return
@@ -587,14 +587,12 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "请提供搜索关键词。\n\n"
                     "用法示例：\n"
-                    "• `/search 关键词` (智能模式)\n"
-                    "• `/search --comprehensive 关键词` (全面搜索)\n"
-                    "• `/search --com 关键词` (全面搜索，--comprehensive 的简写)\n"
-                    "• `/search --fts 关键词` (仅FTS5)\n"
-                    "• `/search --like 关键词` (仅模糊匹配)\n"
-                    "• `/search -5 关键词` (限制5个结果)\n"
-                    "• `/search -n=5 关键词` (限制5个结果)\n"
-                    "• `/search --max=10 --com 关键词` (全面搜索，最多10个结果)",
+                    "• `/find 关键词` (精确匹配，不分词)\n"
+                    "• `/find --comprehensive 关键词` 或 `/find --com 关键词` (全面搜索，包含分词)\n"
+                    "• `/find --contains 关键词` (内存遍历搜索，最准确)\n"
+                    "• `/find -5 关键词` (限制5个结果)\n"
+                    "• `/find -n=5 关键词` (限制5个结果)\n"
+                    "• `/find --max=10 --com 关键词` (全面搜索，最多10个结果)",
                     parse_mode='Markdown',
                     reply_to_message_id=update.message.message_id
                 )
@@ -610,10 +608,9 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # 构建搜索模式说明
             mode_desc = {
-                'smart': '智能',
+                'exact': '精确',
                 'comprehensive': '全面', 
-                'fts': 'FTS5',
-                'like': '模糊匹配'
+                'contains': '包含'
             }.get(search_mode, search_mode)
             
             # 当只有一个结果时
@@ -701,11 +698,10 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Invalid usage of /find command
     else:
         help_text = """使用方法：
-1. <code>/find &lt;关键词&gt;</code> (智能模式文本搜索)
-2. <code>/find --comprehensive &lt;关键词&gt;</code> 或 <code>/find --com &lt;关键词&gt;</code> (全面搜索)
-3. <code>/find --fts &lt;关键词&gt;</code> (仅使用FTS5全文搜索)
-4. <code>/find --like &lt;关键词&gt;</code> (仅使用模糊匹配)
-5. 回复一张图片并发送 <code>/find</code> (图片搜索)"""
+1. <code>/find &lt;关键词&gt;</code> (精确匹配，不分词)
+2. <code>/find --comprehensive &lt;关键词&gt;</code> 或 <code>/find --com &lt;关键词&gt;</code> (全面搜索，包含分词)
+3. <code>/find --contains &lt;关键词&gt;</code> (内存遍历搜索，最准确)
+4. 回复一张图片并发送 <code>/find</code> (图片搜索)"""
         await update.message.reply_text(help_text, parse_mode='HTML', reply_to_message_id=update.message.message_id)
 
 

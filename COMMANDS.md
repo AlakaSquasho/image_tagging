@@ -30,10 +30,9 @@
 ```
 
 **参数选项：**
-- 默认（智能模式）：`/find 猫咪`
-- `--comprehensive`：全面搜索，合并FTS5和模糊匹配 `/find --comprehensive 猫咪`
-- `--fts`：仅使用FTS5全文搜索 `/find --fts 猫咪`
-- `--like`：仅使用模糊匹配 `/find --like 猫咪`
+- 默认（精确匹配模式）：`/find 猫咪` - 直接使用关键词进行匹配，不分词
+- `--comprehensive` 或 `--com`：全面搜索，包含关键词+分词结果 `/find --com 猫咪`
+- `--contains`：内存遍历搜索，最准确但可能较慢 `/find --contains 猫咪`
 - `-5` 或 `-n=5`：限制返回5个结果 `/find -5 猫咪`
 
 #### 用法二：图片搜索

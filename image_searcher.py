@@ -61,6 +61,12 @@ class ImageSimilaritySearcher:
             self.logger.info("OpenCC simplified-traditional Chinese converters initialized.")
         except Exception as e:
             self.logger.warning(f"Failed to initialize OpenCC: {e}. Simplified-traditional conversion may not work.")
+        
+        # 初始化OCR文本内存缓存，用于高效的字符串包含搜索
+        self._ocr_cache = {}  # {file_path: ocr_text}
+        self._cache_lock = threading.RLock()
+        self._load_ocr_cache()
+        self.logger.info(f"OCR text cache initialized with {len(self._ocr_cache)} entries.")
 
     def _ensure_ocr_engine(self):
         """确保OCR引擎已加载（懒加载模式）"""
@@ -82,6 +88,35 @@ class ImageSimilaritySearcher:
     def _use_mac_shortcuts(self) -> bool:
         """判断是否使用 Mac 快捷指令进行 OCR"""
         return bool(MAC_SHORTCUTS) and platform.system() == 'Darwin'
+    
+    def _load_ocr_cache(self):
+        """从数据库加载所有OCR文本到内存缓存"""
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT file_path, ocr_text FROM image_features WHERE ocr_status = 'completed' AND ocr_text IS NOT NULL AND ocr_text != ''"
+                )
+                with self._cache_lock:
+                    self._ocr_cache = {row[0]: row[1] for row in cursor.fetchall()}
+                self.logger.info(f"Loaded {len(self._ocr_cache)} OCR texts into cache")
+            except Exception as e:
+                self.logger.error(f"Failed to load OCR cache: {e}")
+                self._ocr_cache = {}
+    
+    def _update_ocr_cache(self, file_path: str, ocr_text: str):
+        """更新内存缓存中的OCR文本"""
+        with self._cache_lock:
+            if ocr_text and ocr_text.strip():
+                self._ocr_cache[file_path] = ocr_text
+            elif file_path in self._ocr_cache:
+                del self._ocr_cache[file_path]
+    
+    def _remove_from_ocr_cache(self, file_path: str):
+        """从内存缓存中移除OCR文本"""
+        with self._cache_lock:
+            if file_path in self._ocr_cache:
+                del self._ocr_cache[file_path]
     
     def _get_clipboard_content(self) -> str:
         """
@@ -568,15 +603,26 @@ class ImageSimilaritySearcher:
                 return None
 
     def _update_ocr_result(self, img_id: int, ocr_text: str, status: str, fail_count: int):
-        """更新OCR结果"""
+        """更新OCR结果并同步更新内存缓存"""
         with self._db_lock:
             cursor = self.conn.cursor()
             try:
+                # 先获取文件路径
+                cursor.execute("SELECT file_path FROM image_features WHERE id = ?", (img_id,))
+                result = cursor.fetchone()
+                file_path = result[0] if result else None
+                
+                # 更新数据库
                 cursor.execute(
                     "UPDATE image_features SET ocr_text = ?, ocr_status = ?, ocr_fail_count = ? WHERE id = ?",
                     (ocr_text, status, fail_count, img_id)
                 )
                 self.conn.commit()
+                
+                # 更新内存缓存
+                if file_path and status == 'completed':
+                    self._update_ocr_cache(file_path, ocr_text)
+                    
             except Exception as e:
                 self.logger.error(f"Failed to update OCR result for image id {img_id}: {e}")
                 self.conn.rollback()
@@ -782,6 +828,9 @@ class ImageSimilaritySearcher:
                 )
                 self.conn.commit()
                 
+                # 更新内存缓存
+                self._update_ocr_cache(file_path, cleaned_ocr_text)
+                
                 self.logger.info(f"Manually set OCR result for {file_path} (file_hash: {file_hash}): '{ocr_text}'")
                 return True
                 
@@ -878,6 +927,9 @@ class ImageSimilaritySearcher:
                     (time.time(), img_id)
                 )
                 self.conn.commit()
+                
+                # 从内存缓存中移除
+                self._remove_from_ocr_cache(file_path)
                 
                 self.logger.info(f"Cleared OCR result for {file_path} (message_id: {telegram_message_id})")
                 return True
@@ -984,154 +1036,206 @@ class ImageSimilaritySearcher:
                 self.logger.error(f"Error during similarity search: {e}")
                 return []
 
-    def search_by_text(self, keywords: str, max_results: int = 3, search_mode: str = 'smart') -> List[Dict]:
+    def search_by_text(self, keywords: str, max_results: int = 3, search_mode: str = 'exact') -> List[Dict]:
         """
-        根据关键字搜索，支持模糊匹配、分词和简繁互转。
-        使用 jieba 对查询关键字进行分词，支持简体和繁体互查。
-        返回包含文件路径和消息ID的字典列表。
+        根据关键字搜索，支持多种搜索模式。
         
         Args:
             keywords: 搜索关键词
             max_results: 最大返回结果数
             search_mode: 搜索模式
-                - 'smart': 智能搜索，优先FTS5，回退到LIKE
-                - 'comprehensive': 全面搜索，FTS5 + LIKE 结果合并去重
-                - 'fts': 仅使用FTS5搜索
-                - 'like': 仅使用LIKE搜索
+                - 'exact': 精确匹配模式（默认），直接使用关键词进行匹配，不分词
+                - 'comprehensive': 全面搜索模式，使用关键词+分词结果进行匹配
+                - 'contains': 字符串包含搜索（内存遍历），最基础但最准确
+        """
+        try:
+            # 清理和规范化查询文本
+            cleaned_keywords = keywords.strip()
+            if not cleaned_keywords:
+                self.logger.warning(f"Query keywords empty after cleaning: '{keywords}'")
+                return []
+            
+            if search_mode == 'comprehensive':
+                # 全面搜索模式：关键词 + 分词结果
+                return self._comprehensive_search(cleaned_keywords, max_results)
+            elif search_mode == 'contains':
+                # 内存遍历搜索
+                return self._memory_contains_search(cleaned_keywords, max_results)
+            else:
+                # 默认精确匹配模式
+                return self._exact_match_search(cleaned_keywords, max_results)
+                    
+        except Exception as e:
+            self.logger.error(f"Error during text search: {e}")
+            return []
+    
+    def _exact_match_search(self, keywords: str, max_results: int) -> List[Dict]:
+        """
+        精确匹配搜索：直接使用关键词进行LIKE匹配，不分词。
+        支持简繁体互查。
         """
         with self._db_lock:
             cursor = self.conn.cursor()
             try:
-                # 清理和规范化查询文本
-                cleaned_keywords = self._normalize_query_text(keywords)
-                if not cleaned_keywords:
-                    self.logger.warning(f"Query keywords empty after cleaning: '{keywords}'")
-                    return []
+                # 获取关键词的简繁体变体
+                variants = self._get_keyword_variants(keywords)
                 
-                # 对清理后的关键字进行分词
-                query_tokens = self._tokenize_text(cleaned_keywords)
+                # 构建LIKE查询
+                where_clauses = ["ocr_text LIKE ?" for _ in variants]
+                where_sql = ' OR '.join(where_clauses)
+                query_params = [f"%{variant}%" for variant in variants] + [max_results]
                 
-                if search_mode == 'comprehensive':
-                    # 全面搜索模式：合并FTS5和LIKE结果
-                    return self._comprehensive_search(cursor, query_tokens, cleaned_keywords, max_results)
-                elif search_mode == 'fts':
-                    # 仅FTS5搜索
-                    return self._fts_search_only(cursor, query_tokens, max_results)
-                elif search_mode == 'like':
-                    # 仅LIKE搜索
-                    return self._like_search_only(cursor, query_tokens, cleaned_keywords, max_results)
-                else:
-                    # 默认智能搜索模式
-                    return self._smart_search(cursor, query_tokens, cleaned_keywords, max_results)
-                    
-            except Exception as e:
-                self.logger.error(f"Error during text search: {e}")
-                return []
-    
-    def _comprehensive_search(self, cursor, query_tokens: List[str], cleaned_keywords: str, max_results: int) -> List[Dict]:
-        """全面搜索：合并FTS5和LIKE结果"""
-        results_map = {}  # 使用字典去重，key为file_path
-        
-        # 1. 先尝试FTS5搜索
-        fts_results = self._fts_search_only(cursor, query_tokens, max_results * 2)  # 获取更多FTS结果
-        for result in fts_results:
-            results_map[result['path']] = result
-        
-        # 2. 如果FTS5结果不足，补充LIKE搜索
-        if len(results_map) < max_results:
-            like_results = self._like_search_only(cursor, query_tokens, cleaned_keywords, max_results * 2)
-            for result in like_results:
-                if result['path'] not in results_map:
-                    results_map[result['path']] = result
-        
-        # 3. 返回结果，按更新时间排序
-        final_results = list(results_map.values())
-        final_results.sort(key=lambda x: x.get('updated_time', 0), reverse=True)
-        
-        self.logger.info(f"Comprehensive search for '{cleaned_keywords}' found {len(final_results)} unique results")
-        return final_results[:max_results]
-    
-    def _fts_search_only(self, cursor, query_tokens: List[str], max_results: int) -> List[Dict]:
-        """仅使用FTS5搜索"""
-        if not query_tokens:
-            return []
-        
-        # 获取所有变体（简体和繁体）
-        all_variants = self._get_all_variants(query_tokens)
-        
-        # 构建 FTS5 查询：使用 OR 逻辑（任何一个词匹配即可）
-        fts_query = ' OR '.join([f'"{variant}"' for variant in all_variants])  # 使用短语查询提高准确性
-        
-        try:
-            cursor.execute('''
-                SELECT f.file_path, f.telegram_message_id, f.updated_time, bm25(image_text_search) as score
-                FROM image_text_search
-                JOIN image_features f ON image_text_search.rowid = f.id
-                WHERE image_text_search MATCH ? ORDER BY score DESC LIMIT ?
-            ''', (fts_query, max_results))
-            
-            results = [{
-                'path': row[0], 
-                'telegram_message_id': row[1],
-                'updated_time': row[2],
-                'search_method': 'FTS5',
-                'score': row[3]
-            } for row in cursor.fetchall()]
-            
-            if results:
-                self.logger.info(f"FTS5 search found {len(results)} results")
+                cursor.execute(f'''
+                    SELECT file_path, telegram_message_id, updated_time FROM image_features 
+                    WHERE ocr_status = 'completed' AND ({where_sql})
+                    ORDER BY updated_time DESC LIMIT ?
+                ''', query_params)
+                
+                results = [{
+                    'path': row[0], 
+                    'telegram_message_id': row[1],
+                    'updated_time': row[2],
+                    'search_method': 'EXACT'
+                } for row in cursor.fetchall()]
+                
+                self.logger.info(f"Exact match search for '{keywords}' found {len(results)} results")
                 return results
                 
-        except sqlite3.OperationalError as e:
-            self.logger.debug(f"FTS5 search failed: {e}")
-        
-        return []
+            except Exception as e:
+                self.logger.error(f"Exact match search failed: {e}")
+                return []
     
-    def _like_search_only(self, cursor, query_tokens: List[str], cleaned_keywords: str, max_results: int) -> List[Dict]:
-        """仅使用LIKE搜索"""
-        if query_tokens:
-            # 使用分词结果
-            all_variants = self._get_all_variants(query_tokens)
-        else:
-            # 回退到原始关键字
-            all_variants = [cleaned_keywords]
-        
-        # 构建 LIKE 查询：ANY 条件满足就返回
-        where_clauses = [f"ocr_text LIKE ?" for _ in all_variants]
-        where_sql = ' OR '.join(where_clauses)
-        query_params = [f"%{variant}%" for variant in all_variants] + [max_results]
-        
-        cursor.execute(f'''
-            SELECT file_path, telegram_message_id, updated_time FROM image_features 
-            WHERE {where_sql}
-            ORDER BY updated_time DESC LIMIT ?
-        ''', query_params)
-        
-        results = [{
-            'path': row[0], 
-            'telegram_message_id': row[1],
-            'updated_time': row[2],
-            'search_method': 'LIKE'
-        } for row in cursor.fetchall()]
-        
-        self.logger.info(f"LIKE search found {len(results)} results")
-        return results
+    def _comprehensive_search(self, keywords: str, max_results: int) -> List[Dict]:
+        """
+        全面搜索：使用关键词本身 + 分词后的词汇进行搜索。
+        结果去重，按更新时间排序。
+        """
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                results_map = {}  # 使用字典去重，key为file_path
+                
+                # 1. 首先搜索完整关键词
+                exact_results = self._exact_match_search(keywords, max_results * 2)
+                for result in exact_results:
+                    results_map[result['path']] = result
+                
+                # 2. 对关键词进行分词
+                query_tokens = self._tokenize_text(keywords)
+                
+                if query_tokens:
+                    # 获取所有分词的简繁体变体
+                    all_variants = self._get_all_variants(query_tokens)
+                    
+                    # 构建LIKE查询（使用OR逻辑，任一分词匹配即可）
+                    where_clauses = ["ocr_text LIKE ?" for _ in all_variants]
+                    where_sql = ' OR '.join(where_clauses)
+                    query_params = [f"%{variant}%" for variant in all_variants] + [max_results * 2]
+                    
+                    cursor.execute(f'''
+                        SELECT file_path, telegram_message_id, updated_time FROM image_features 
+                        WHERE ocr_status = 'completed' AND ({where_sql})
+                        ORDER BY updated_time DESC LIMIT ?
+                    ''', query_params)
+                    
+                    for row in cursor.fetchall():
+                        if row[0] not in results_map:
+                            results_map[row[0]] = {
+                                'path': row[0],
+                                'telegram_message_id': row[1],
+                                'updated_time': row[2],
+                                'search_method': 'COMPREHENSIVE'
+                            }
+                
+                # 3. 返回结果，按更新时间排序
+                final_results = list(results_map.values())
+                final_results.sort(key=lambda x: x.get('updated_time', 0), reverse=True)
+                
+                self.logger.info(f"Comprehensive search for '{keywords}' found {len(final_results)} unique results")
+                return final_results[:max_results]
+                
+            except Exception as e:
+                self.logger.error(f"Comprehensive search failed: {e}")
+                return []
     
-    def _smart_search(self, cursor, query_tokens: List[str], cleaned_keywords: str, max_results: int) -> List[Dict]:
-        """智能搜索：优先FTS5，不足时回退到LIKE"""
-        # 先尝试FTS5
-        results = self._fts_search_only(cursor, query_tokens, max_results)
+    def _memory_contains_search(self, keywords: str, max_results: int) -> List[Dict]:
+        """
+        内存遍历搜索：在内存中遍历所有OCR文本，查找包含关键词的记录。
+        这是最基础但也最准确的搜索方式。
+        """
+        try:
+            # 获取关键词的简繁体变体（小写化以支持大小写不敏感搜索）
+            variants = [v.lower() for v in self._get_keyword_variants(keywords)]
+            
+            matched_paths = []
+            with self._cache_lock:
+                for file_path, ocr_text in self._ocr_cache.items():
+                    # 小写化OCR文本进行比较
+                    ocr_lower = ocr_text.lower()
+                    # 检查是否包含任一变体
+                    if any(variant in ocr_lower for variant in variants):
+                        matched_paths.append(file_path)
+                        if len(matched_paths) >= max_results * 10:  # 预先获取更多以便后续排序
+                            break
+            
+            # 从数据库获取完整信息
+            if not matched_paths:
+                self.logger.info(f"Memory contains search for '{keywords}' found 0 results")
+                return []
+            
+            with self._db_lock:
+                cursor = self.conn.cursor()
+                placeholders = ','.join(['?'] * len(matched_paths))
+                cursor.execute(f'''
+                    SELECT file_path, telegram_message_id, updated_time 
+                    FROM image_features 
+                    WHERE file_path IN ({placeholders})
+                    ORDER BY updated_time DESC
+                ''', matched_paths)
+                
+                results = [{
+                    'path': row[0],
+                    'telegram_message_id': row[1],
+                    'updated_time': row[2],
+                    'search_method': 'CONTAINS'
+                } for row in cursor.fetchall()]
+            
+            self.logger.info(f"Memory contains search for '{keywords}' found {len(results)} results")
+            return results[:max_results]
+            
+        except Exception as e:
+            self.logger.error(f"Memory contains search failed: {e}")
+            return []
+    
+    def _get_keyword_variants(self, keyword: str) -> List[str]:
+        """
+        获取单个关键词的简繁体变体。
+        不进行分词，保持关键词完整。
+        """
+        if not hasattr(self, 'cc_s2t') or not hasattr(self, 'cc_t2s'):
+            return [keyword]
         
-        if results:
-            return results
-        
-        # FTS5无结果时回退到LIKE
-        self.logger.info("FTS5 search returned no results, falling back to LIKE search")
-        return self._like_search_only(cursor, query_tokens, cleaned_keywords, max_results)
+        try:
+            variants = [keyword]  # 原始关键词
+            
+            # 生成繁体变体
+            traditional = self.cc_s2t.convert(keyword)
+            if traditional != keyword and traditional not in variants:
+                variants.append(traditional)
+            
+            # 生成简体变体
+            simplified = self.cc_t2s.convert(keyword)
+            if simplified != keyword and simplified not in variants:
+                variants.append(simplified)
+            
+            return variants
+        except Exception as e:
+            self.logger.debug(f"Failed to get variants for '{keyword}': {e}")
+            return [keyword]
 
     def update_archived_file_paths(self, path_mappings: List[Tuple[str, str]]):
         """
-        批量更新数据库中图片的file_path。
+        批量更新数据库中图片的file_path，并同步更新内存缓存。
         path_mappings: 列表，每个元素为 (old_path, new_path)
         """
         if not path_mappings:
@@ -1147,6 +1251,14 @@ class ImageSimilaritySearcher:
                 )
                 self.conn.commit()
                 self.logger.info(f"Successfully updated {len(path_mappings)} file paths in database after archiving.")
+                
+                # 更新内存缓存中的路径
+                with self._cache_lock:
+                    for old_path, new_path in path_mappings:
+                        if old_path in self._ocr_cache:
+                            self._ocr_cache[new_path] = self._ocr_cache.pop(old_path)
+                self.logger.info(f"Updated {len(path_mappings)} file paths in OCR cache.")
+                
             except Exception as e:
                 self.logger.error(f"Failed to update file paths in database during archiving: {e}")
                 self.conn.rollback()
