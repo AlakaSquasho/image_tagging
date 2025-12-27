@@ -1623,6 +1623,20 @@ def parse_scheduled_time(time_str: str) -> Optional[time]:
         return None
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    全局错误处理器，处理所有未捕获的异常
+    重要：此处理器会捕获网络错误，防止bot完全无响应
+    """
+    logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
+    
+    # 如果是网络错误，记录但继续运行（不会中断bot的polling）
+    if isinstance(context.error, Exception):
+        error_name = context.error.__class__.__name__
+        error_msg = str(context.error)
+        logger.warning(f"Network/Connection error occurred: {error_name}: {error_msg}. Bot will continue polling...")
+
+
 def signal_handler(signum, frame):
     """
     信号处理函数，用于优雅退出
@@ -1669,6 +1683,9 @@ if __name__ == '__main__':
         .build()
     )
     
+    # 注册全局错误处理器，这是修复网络错误导致bot无响应的关键
+    application.add_error_handler(error_handler)
+    
     # Add handlers - 新命令体系，首字母即可区分
     application.add_handler(CommandHandler('find', find_command))      # 搜索（替代search）
     application.add_handler(CommandHandler('ocr', ocr_command))        # OCR处理（替代forceOCR）
@@ -1699,5 +1716,31 @@ if __name__ == '__main__':
     
     # 启动 Bot
     logger.info("🤖 机器人启动中...")
-    application.run_polling()
+    
+    # 使用try-except包装polling，确保网络错误时bot能够恢复
+    retry_count = 0
+    max_retries = 5
+    retry_interval = 15  # 秒
+    
+    while True:
+        try:
+            logger.info("开始polling...")
+            application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+            break  # 如果正常退出，就break
+        except KeyboardInterrupt:
+            logger.info("收到键盘中断信号，正在优雅关闭...")
+            break
+        except Exception as e:
+            retry_count += 1
+            error_name = e.__class__.__name__
+            error_msg = str(e)
+            logger.error(f"Polling出错 ({retry_count}/{max_retries}): {error_name}: {error_msg}", exc_info=True)
+            
+            if retry_count >= max_retries:
+                logger.error(f"已达到最大重试次数({max_retries})，停止bot")
+                break
+            
+            logger.info(f"{retry_interval}秒后尝试重新启动polling...")
+            import time
+            time.sleep(retry_interval)
 
