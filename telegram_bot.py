@@ -1649,62 +1649,67 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
-if __name__ == '__main__':
-    # 注册信号处理器
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)  # 同时处理Ctrl+C
+def create_application():
+    """
+    创建并配置 Telegram Application 实例。
     
-    logger.info("Starting bot...")
+    将此逻辑封装为函数，以便在网络错误时可以重新创建整个 application，
+    包括新的连接池，解决连接池损坏后无法恢复的问题。
     
-    # 配置连接池参数，解决连接池耗尽问题
+    Returns:
+        Application: 配置好的 Telegram Application 实例
+    """
     from telegram.ext import ApplicationBuilder
     from telegram.request import HTTPXRequest
     
     # 创建自定义请求对象，增大连接池和超时时间
+    # 关键修复：禁用HTTP/2以避免代理环境下的TLS握手错误
     request = HTTPXRequest(
         connection_pool_size=20,       # 增大连接池（默认1）
         read_timeout=30.0,             # 读取超时（秒）
         write_timeout=30.0,            # 写入超时（秒）
         connect_timeout=30.0,          # 连接超时（秒）
         pool_timeout=10.0,             # 连接池等待超时（秒）
+        http_version="1.1",            # 禁用HTTP/2，使用HTTP/1.1以提高代理兼容性
     )
     
-    application = (
+    app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .request(request)
         .get_updates_request(HTTPXRequest(
             connection_pool_size=10,   # get_updates 专用连接池
-            read_timeout=30.0,
+            read_timeout=60.0,         # 长轮询需要更长的读取超时
             write_timeout=30.0,
             connect_timeout=30.0,
             pool_timeout=10.0,
+            http_version="1.1",        # 禁用HTTP/2，避免TLS握手错误
         ))
         .build()
     )
     
-    # 注册全局错误处理器，这是修复网络错误导致bot无响应的关键
-    application.add_error_handler(error_handler)
+    # 注册全局错误处理器
+    app.add_error_handler(error_handler)
     
     # Add handlers - 新命令体系，首字母即可区分
-    application.add_handler(CommandHandler('find', find_command))      # 搜索（替代search）
-    application.add_handler(CommandHandler('ocr', ocr_command))        # OCR处理（替代forceOCR）
-    application.add_handler(CommandHandler('tag', tag_command))        # 设置标签（替代setocr）
-    application.add_handler(CommandHandler('untag', untag_command))    # 清除标签（替代clearocr）
-    application.add_handler(CommandHandler('link', setmessageid_command))  # 设置消息ID（新命令）
-    application.add_handler(CommandHandler('getocr', getocr_command))  # 查询OCR结果（新命令）
-    application.add_handler(CommandHandler('failed', failed_command))  # 查询OCR失败记录（新命令）
+    app.add_handler(CommandHandler('find', find_command))      # 搜索（替代search）
+    app.add_handler(CommandHandler('ocr', ocr_command))        # OCR处理（替代forceOCR）
+    app.add_handler(CommandHandler('tag', tag_command))        # 设置标签（替代setocr）
+    app.add_handler(CommandHandler('untag', untag_command))    # 清除标签（替代clearocr）
+    app.add_handler(CommandHandler('link', setmessageid_command))  # 设置消息ID（新命令）
+    app.add_handler(CommandHandler('getocr', getocr_command))  # 查询OCR结果（新命令）
+    app.add_handler(CommandHandler('failed', failed_command))  # 查询OCR失败记录（新命令）
     # handle_photo processes all photo messages, internal logic decides add or search
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
     # Add scheduled OCR task
     # 注意：定时任务使用北京时间(UTC+8)配置，实际调度时间会自动转换为UTC
     scheduled_ocr_time = parse_scheduled_time(OCR_SCHEDULED_TIME)
     if scheduled_ocr_time:
-        job_queue = application.job_queue
+        job_queue = app.job_queue
         
         # 添加定时任务（只注册一次）
-        job = job_queue.run_daily(
+        job_queue.run_daily(
             scheduled_ocr_task, 
             time=scheduled_ocr_time,
             name="daily_ocr_task"  # 给任务命名，防止重复注册
@@ -1714,16 +1719,34 @@ if __name__ == '__main__':
     else:
         logger.warning(f"Failed to parse OCR scheduled time: {OCR_SCHEDULED_TIME}")
     
+    return app
+
+
+if __name__ == '__main__':
+    # 注册信号处理器
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)  # 同时处理Ctrl+C
+    
+    logger.info("Starting bot...")
+    
     # 启动 Bot
     logger.info("🤖 机器人启动中...")
     
     # 使用try-except包装polling，确保网络错误时bot能够恢复
+    # 关键修复：每次重试时重新创建application，确保连接池被完全重建
     retry_count = 0
-    max_retries = 5
-    retry_interval = 15  # 秒
+    max_retries = 10  # 增加最大重试次数，提高容错能力
+    base_retry_interval = 15  # 基础重试间隔（秒）
+    application = None
     
     while True:
         try:
+            # 每次循环都重新创建 application，确保连接池是全新的
+            # 这是解决连接池损坏后无法恢复的关键
+            if application is None or retry_count > 0:
+                logger.info(f"创建新的Application实例 (重试次数: {retry_count})...")
+                application = create_application()
+            
             logger.info("开始polling...")
             application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
             break  # 如果正常退出，就break
@@ -1736,11 +1759,18 @@ if __name__ == '__main__':
             error_msg = str(e)
             logger.error(f"Polling出错 ({retry_count}/{max_retries}): {error_name}: {error_msg}", exc_info=True)
             
+            # 重置 application 为 None，强制下次循环重新创建
+            # 这确保了损坏的连接池会被丢弃
+            application = None
+            
             if retry_count >= max_retries:
                 logger.error(f"已达到最大重试次数({max_retries})，停止bot")
                 break
             
-            logger.info(f"{retry_interval}秒后尝试重新启动polling...")
+            # 使用指数退避策略，避免频繁重试
+            # 重试间隔：15s, 30s, 60s, 120s, ... 最大300s
+            retry_interval = min(base_retry_interval * (2 ** (retry_count - 1)), 300)
+            logger.info(f"{retry_interval}秒后尝试重新启动polling（指数退避）...")
             import time
             time.sleep(retry_interval)
 
