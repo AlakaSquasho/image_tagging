@@ -1493,19 +1493,42 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
     
     为了避免OCR任务积压，本任务会循环调用process_ocr_pending_images，
     直到所有待处理的图片都被处理完成。
+    
+    修复：添加超时保护和完善的错误处理，防止任务卡死导致程序无响应
     """
     import gc
+    from concurrent.futures import ThreadPoolExecutor
     
     task_start_time = datetime.now()
     logger.info(f"Scheduled OCR task started at: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # 创建专用的线程池执行器，确保可以正确清理
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr_scheduled")
+    
+    # 定义网络操作超时时间（秒）
+    NETWORK_TIMEOUT = 30.0
+    
+    async def safe_send_message(text: str) -> bool:
+        """带超时保护的消息发送"""
+        try:
+            await asyncio.wait_for(
+                context.bot.send_message(chat_id=ALLOWED_USER_ID, text=text),
+                timeout=NETWORK_TIMEOUT
+            )
+            return True
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout sending message: {text[:50]}...")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+            return False
     
     try:
         pending_count = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
         if pending_count == 0:
             logger.info("Scheduled OCR task: No pending images.")
-            await context.bot.send_message(
-                chat_id=ALLOWED_USER_ID, 
-                text=f"✅ 定时OCR任务完成\n当前无待处理图片\n执行时间: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            await safe_send_message(
+                f"✅ 定时OCR任务完成\n当前无待处理图片\n执行时间: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}"
             )
             return
         
@@ -1514,8 +1537,9 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
         # 关键改进：循环处理，直到没有待处理的图片
         total_stats = {'processed': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0}
         iteration = 0
+        max_iterations = 100  # 添加最大迭代次数防护
         
-        while True:
+        while iteration < max_iterations:
             iteration += 1
             remaining = searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
             if remaining == 0:
@@ -1523,12 +1547,22 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
                 break
             
             logger.info(f"OCR task iteration {iteration}: Processing {remaining} pending images...")
-            # Run blocking OCR task in a separate thread
+            
+            # 使用专用执行器运行阻塞的 OCR 任务
             loop = asyncio.get_running_loop()
-            stats = await loop.run_in_executor(
-                None, 
-                lambda: searcher.process_ocr_pending_images(batch_size=OCR_BATCH_SIZE, max_retries=OCR_MAX_RETRIES)
-            )
+            try:
+                # 添加超时保护：每批次最多处理 10 分钟
+                stats = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        executor, 
+                        lambda: searcher.process_ocr_pending_images(batch_size=OCR_BATCH_SIZE, max_retries=OCR_MAX_RETRIES)
+                    ),
+                    timeout=600.0  # 10 分钟超时
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"OCR batch processing timeout in iteration {iteration}")
+                total_stats['failed'] += OCR_BATCH_SIZE  # 估算失败数量
+                break
             
             # 累计统计
             total_stats['processed'] += stats['processed']
@@ -1544,8 +1578,10 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Iteration {iteration} completed: {stats}")
             
             # 每批次处理后显式触发垃圾回收
-            # 注意：OCR引擎采用懒加载模式，每批处理完会自动清理，下次需要时自动加载
             gc.collect()
+            
+            # 添加心跳日志，证明程序仍在运行
+            logger.info(f"💓 Heartbeat: OCR task still running after iteration {iteration}")
         
         # 计算任务耗时
         task_end_time = datetime.now()
@@ -1573,12 +1609,8 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
                 f"这些图片会在后续任务中继续重试（最多 {OCR_MAX_RETRIES} 次）。"
             )
         
-        await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=message)
+        await safe_send_message(message)
         logger.info(f"Scheduled OCR task completed successfully: {total_stats}, iterations: {iteration}, duration: {duration_str}")
-        
-        # 最终垃圾回收
-        gc.collect()
-        logger.info(f"Memory cleanup completed after scheduled OCR task")
         
     except Exception as e:
         task_duration = datetime.now() - task_start_time
@@ -1586,17 +1618,31 @@ async def scheduled_ocr_task(context: ContextTypes.DEFAULT_TYPE):
         
         logger.error(f"Error in scheduled OCR task: {e}", exc_info=True)
         
+        error_message = (
+            f"❌ 定时OCR任务出现错误\n\n"
+            f"错误信息: {str(e)}\n"
+            f"执行时间: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"失败耗时: {duration_str}\n\n"
+            f"请检查日志获取详细错误信息。"
+        )
+        await safe_send_message(error_message)
+        
+    finally:
+        # 关键修复：确保执行器被正确关闭，释放线程资源
         try:
-            error_message = (
-                f"❌ 定时OCR任务出现错误\n\n"
-                f"错误信息: {str(e)}\n"
-                f"执行时间: {task_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"失败耗时: {duration_str}\n\n"
-                f"请检查日志获取详细错误信息。"
-            )
-            await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=error_message)
-        except Exception as send_error:
-            logger.error(f"Failed to send error message to user: {send_error}")
+            executor.shutdown(wait=False, cancel_futures=True)
+            logger.info("OCR executor shutdown completed")
+        except Exception as e:
+            logger.error(f"Error shutting down executor: {e}")
+        
+        # 最终垃圾回收
+        gc.collect()
+        
+        # 确保记录任务结束，无论成功还是失败
+        task_end_time = datetime.now()
+        total_duration = (task_end_time - task_start_time).total_seconds()
+        logger.info(f"🏁 Scheduled OCR task cleanup completed. Total duration: {total_duration:.1f}s")
+
 
 
 def parse_scheduled_time(time_str: str) -> Optional[time]:
@@ -1665,11 +1711,11 @@ def create_application():
     # 创建自定义请求对象，增大连接池和超时时间
     # 关键修复：禁用HTTP/2以避免代理环境下的TLS握手错误
     request = HTTPXRequest(
-        connection_pool_size=20,       # 增大连接池（默认1）
-        read_timeout=30.0,             # 读取超时（秒）
-        write_timeout=30.0,            # 写入超时（秒）
-        connect_timeout=30.0,          # 连接超时（秒）
-        pool_timeout=10.0,             # 连接池等待超时（秒）
+        connection_pool_size=30,       # 增大连接池（默认1）
+        read_timeout=45.0,             # 读取超时（秒）
+        write_timeout=45.0,            # 写入超时（秒）
+        connect_timeout=45.0,          # 连接超时（秒）
+        pool_timeout=20.0,             # 连接池等待超时（秒）
         http_version="1.1",            # 禁用HTTP/2，使用HTTP/1.1以提高代理兼容性
     )
     
@@ -1678,11 +1724,11 @@ def create_application():
         .token(BOT_TOKEN)
         .request(request)
         .get_updates_request(HTTPXRequest(
-            connection_pool_size=10,   # get_updates 专用连接池
-            read_timeout=60.0,         # 长轮询需要更长的读取超时
-            write_timeout=30.0,
-            connect_timeout=30.0,
-            pool_timeout=10.0,
+            connection_pool_size=20,   # get_updates 专用连接池
+            read_timeout=90.0,         # 长轮询需要更长的读取超时
+            write_timeout=45.0,
+            connect_timeout=45.0,
+            pool_timeout=20.0,
             http_version="1.1",        # 禁用HTTP/2，避免TLS握手错误
         ))
         .build()
