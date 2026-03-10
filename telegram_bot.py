@@ -17,16 +17,16 @@ except ImportError:
     except ImportError:
         ZoneInfo = None
 
-from telegram import Update, InputFile, MessageOriginChannel
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram import Update, InputFile, MessageOriginChannel, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
-from config import (BOT_TOKEN, ALLOWED_USER_ID, IMAGE_DOWNLOAD_PATH, DB_PATH, LOG_FILE_PATH, 
-                   MAX_IMAGES_IN_DOWNLOAD_FOLDER, OCR_SCHEDULED_TIME, OCR_MAX_RETRIES, OCR_BATCH_SIZE, 
+from config import (BOT_TOKEN, ALLOWED_USER_ID, IMAGE_DOWNLOAD_PATH, DB_PATH, LOG_FILE_PATH,
+                   MAX_IMAGES_IN_DOWNLOAD_FOLDER, OCR_SCHEDULED_TIME, OCR_MAX_RETRIES, OCR_BATCH_SIZE,
                    MAX_RESULTS, SCHEDULER_MISFIRE_GRACE_TIME, SCHEDULER_MAX_INSTANCES, SCHEDULER_COALESCE,
-                   FAILED_OCR_DEFAULT_LIMIT)
+                   FAILED_OCR_DEFAULT_LIMIT, FIND_PAGINATION_ENABLED, FIND_PAGE_SIZE)
 from image_searcher import ImageSimilaritySearcher
 
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 # --- 日志设置 ---
 logging.basicConfig(
@@ -55,13 +55,150 @@ def create_progress_bar(current: int, total: int, bar_length: int = 20) -> str:
     """
     if total == 0:
         return "■" * bar_length + " 0%"
-    
+
     percentage = current / total
     filled = int(bar_length * percentage)
     bar = "█" * filled + "░" * (bar_length - filled)
     percent_str = f"{percentage * 100:.1f}%"
-    
+
     return f"{bar} {percent_str}"
+
+
+def get_find_page_size() -> int:
+    """
+    获取 /find 分页每页数量，并限制在 1-9 之间。
+    超出范围则回退为默认值 9。
+    """
+    try:
+        page_size = int(FIND_PAGE_SIZE)
+    except (TypeError, ValueError):
+        page_size = 9
+
+    if page_size < 1 or page_size > 9:
+        return 9
+    return page_size
+
+
+def paginate_results(results: List[Dict], page: int, page_size: int) -> Tuple[List[Dict], int]:
+    """
+    分页切片并返回当前页结果与总页数。
+    """
+    total = len(results)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    safe_page = min(max(page, 1), total_pages)
+    start = (safe_page - 1) * page_size
+    end = start + page_size
+    return results[start:end], total_pages
+
+
+def build_find_keyboard(page: int, total_pages: int, query_id: str) -> Optional[InlineKeyboardMarkup]:
+    if total_pages <= 1:
+        return None
+
+    prev_page = max(1, page - 1)
+    next_page = min(total_pages, page + 1)
+
+    buttons = [
+        InlineKeyboardButton("上一页", callback_data=f"find_page:{query_id}:{prev_page}"),
+        InlineKeyboardButton(f"{page}/{total_pages}", callback_data="find_page:noop:0"),
+        InlineKeyboardButton("下一页", callback_data=f"find_page:{query_id}:{next_page}"),
+    ]
+    return InlineKeyboardMarkup([buttons])
+
+
+def get_find_summary_text(state: Dict, page: int, total_pages: int) -> str:
+    summary = state.get("summary", "")
+    total = len(state.get("results", []))
+    return f"{summary}\n第 {page}/{total_pages} 页（共 {total} 条）"
+
+
+def build_find_summary_text(state: Dict, page: int, total_pages: int, page_results: List[Dict]) -> str:
+    summary_text = get_find_summary_text(state, page, total_pages)
+    link_lines = [
+        result['telegram_message_id']
+        for result in page_results
+        if result.get('telegram_message_id')
+    ]
+    if link_lines:
+        summary_text = f"{summary_text}\n\n" + "\n".join(link_lines)
+    return summary_text
+
+
+async def render_find_page(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query_id: str,
+    page: int,
+    *,
+    is_callback: bool,
+) -> None:
+    state = context.user_data.get("find_pagination", {}).get(query_id)
+    if not state:
+        if is_callback and update.callback_query:
+            await update.callback_query.answer("分页已失效，请重新搜索。", show_alert=False)
+        return
+
+    results = state.get("results", [])
+    page_size = state.get("page_size", 9)
+    page_results, total_pages = paginate_results(results, page, page_size)
+    page = min(max(page, 1), total_pages)
+
+    keyboard = build_find_keyboard(page, total_pages, query_id)
+    summary_text = build_find_summary_text(state, page, total_pages, page_results)
+
+    chat_id = update.effective_chat.id
+
+    summary_message_id = state.get("summary_message_id")
+    if summary_message_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=summary_message_id)
+        except Exception:
+            pass
+        summary_message_id = None
+        state["summary_message_id"] = None
+
+    message_ids = state.get("message_ids", [])
+    if message_ids:
+        for message_id in message_ids:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                continue
+        message_ids = []
+
+    media_group = []
+    for result in page_results:
+        if not os.path.exists(result['path']):
+            logger.warning(f"Search result file not found: {result['path']}")
+            continue
+        try:
+            with open(result['path'], 'rb') as photo_file:
+                media_group.append(InputMediaPhoto(media=photo_file.read()))
+        except Exception as e:
+            logger.error(f"发送搜索结果图片失败: {e}")
+
+    if media_group:
+        try:
+            media_messages = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+            message_ids.extend([m.message_id for m in media_messages])
+        except Exception as e:
+            logger.error(f"发送图片组失败: {e}")
+
+    if summary_message_id:
+        message_ids.append(summary_message_id)
+    else:
+        summary_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=summary_text,
+            reply_markup=keyboard,
+            reply_to_message_id=update.message.message_id if update.message else None
+        )
+        summary_message_id = summary_message.message_id
+        message_ids.append(summary_message_id)
+
+    state["message_ids"] = message_ids
+    state["current_page"] = page
+    state["summary_message_id"] = summary_message_id
 
 
 # --- 初始化搜索器和下载路径 ---
@@ -87,7 +224,7 @@ def get_image_files_in_folder(folder_path: str) -> List[str]:
         logger.error(f"Error listing files in {folder_path}: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in get_image_files_in_folder: {e}")
-    
+
     return files
 
 
@@ -100,13 +237,13 @@ async def check_and_archive_images(download_folder: str, max_count: int, searche
     if not os.path.exists(download_folder):
         logger.warning(f"Download folder does not exist: {download_folder}")
         return
-    
+
     logger.info(f"Checking image count in {download_folder}...")
     image_files = get_image_files_in_folder(download_folder)
-    
+
     if len(image_files) >= max_count:
         logger.info(f"Image count ({len(image_files)}) reached or exceeded {max_count}. Initiating archive process.")
-        
+
         file_modification_times = []
         valid_image_files = []
         for fpath in image_files:
@@ -133,7 +270,7 @@ async def check_and_archive_images(download_folder: str, max_count: int, searche
 
         min_time = datetime.fromtimestamp(min(file_modification_times))
         max_time = datetime.fromtimestamp(max(file_modification_times))
-        
+
         # Format folder name as YYYY.MM.DD_YYYY.MM.DD
         folder_name = f"{min_time.strftime('%Y.%m.%d')}_{max_time.strftime('%Y.%m.%d')}"
         archive_path = os.path.join(download_folder, folder_name)
@@ -148,12 +285,12 @@ async def check_and_archive_images(download_folder: str, max_count: int, searche
         old_new_paths_for_db = []
         successful_moves_count = 0
         failed_moves = []
-        
+
         for old_path in valid_image_files:
             try:
                 file_name = os.path.basename(old_path)
                 new_path = os.path.join(archive_path, file_name)
-                
+
                 # 避免覆盖同名文件
                 if os.path.exists(new_path):
                     name, ext = os.path.splitext(file_name)
@@ -162,7 +299,7 @@ async def check_and_archive_images(download_folder: str, max_count: int, searche
                         new_path = os.path.join(archive_path, f"{name}_{counter}{ext}")
                         counter += 1
                     logger.info(f"File name conflict, renamed to: {os.path.basename(new_path)}")
-                
+
                 shutil.move(old_path, new_path)
                 old_new_paths_for_db.append((old_path, new_path))
                 successful_moves_count += 1
@@ -173,7 +310,7 @@ async def check_and_archive_images(download_folder: str, max_count: int, searche
             except Exception as e:
                 logger.error(f"Unexpected error moving file {old_path}: {e}")
                 failed_moves.append(old_path)
-        
+
         # 更新数据库
         if old_new_paths_for_db:
             try:
@@ -184,12 +321,12 @@ async def check_and_archive_images(download_folder: str, max_count: int, searche
                 logger.error(f"Failed to update database paths: {e}")
         else:
             logger.warning("No files were successfully moved, database not updated.")
-        
+
         # 发送完成消息
         message = f"下载文件夹已归档。\n新文件夹: `{folder_name}`\n归档图片数量: {successful_moves_count}"
         if failed_moves:
             message += f"\n失败数量: {len(failed_moves)}"
-        
+
         try:
             await context.bot.send_message(
                 chat_id=ALLOWED_USER_ID,
@@ -442,9 +579,22 @@ async def search_by_image(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
             
         # If we reach here, it means there was no exact match (similarity < 1.0)
         # Now, send all found similar results.
-        await update.message.reply_text(f"未找到完全匹配的结果，以下是 {len(results)} 个相似结果:", 
+        if FIND_PAGINATION_ENABLED and len(results) > 1:
+            query_id = str(uuid4())
+            page_size = get_find_page_size()
+            context.user_data.setdefault("find_pagination", {})[query_id] = {
+                "results": results,
+                "mode": "image",
+                "page_size": page_size,
+                "summary": f"未找到完全匹配的结果，以下是 {len(results)} 个相似结果:",
+                "message_ids": []
+            }
+            await render_find_page(update, context, query_id, 1, is_callback=False)
+            return
+
+        await update.message.reply_text(f"未找到完全匹配的结果，以下是 {len(results)} 个相似结果:",
                                         reply_to_message_id=update.message.message_id)
-        
+
         for result in results:
             try:
                 if not os.path.exists(result['path']):
@@ -623,7 +773,7 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     filename = os.path.basename(result['path'])
                     message = f"找到1个文本匹配结果 ({mode_desc}模式)，文件路径：<code>{filename}</code>"
                     await update.message.reply_text(message, reply_to_message_id=update.message.message_id, parse_mode='HTML')
-                    
+
                     # 发送图片文件
                     try:
                         if os.path.exists(result['path']):
@@ -638,35 +788,49 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         logger.error(f"发送搜索结果图片失败: {e}")
                         await update.message.reply_text(f"发送图片失败: {filename}")
             else:
+                if FIND_PAGINATION_ENABLED and len(results) > 1:
+                    query_id = str(uuid4())
+                    page_size = get_find_page_size()
+                    context.user_data.setdefault("find_pagination", {})[query_id] = {
+                        "results": results,
+                        "mode": "text",
+                        "search_mode": search_mode,
+                        "page_size": page_size,
+                        "summary": f"找到 {len(results)} 个文本匹配结果 ({mode_desc}模式):",
+                        "message_ids": []
+                    }
+                    await render_find_page(update, context, query_id, 1, is_callback=False)
+                    return
+
                 # 当有多个结果时，先回复总数
                 await update.message.reply_text(
-                    f"找到 {len(results)} 个文本匹配结果 ({mode_desc}模式):", 
+                    f"找到 {len(results)} 个文本匹配结果 ({mode_desc}模式):",
                     reply_to_message_id=update.message.message_id
                 )
-                
+
                 # 分类处理结果：有消息ID的和没有消息ID的
                 with_message_id = []
                 without_message_id = []
-                
+
                 for result in results:
                     if result.get('telegram_message_id'):
                         with_message_id.append(result)
                     else:
                         without_message_id.append(result)
-                
+
                 # 处理有消息ID的结果 - 合并为一条消息
                 if with_message_id:
                     message_lines = []
                     for idx, result in enumerate(with_message_id, 1):
                         message_lines.append(f"{idx}. 原消息ID：{result['telegram_message_id']}")
-                    
+
                     combined_message = "\n".join(message_lines)
                     await context.bot.send_message(
                         chat_id=update.effective_chat.id,
                         text=combined_message,
                         parse_mode='HTML'
                     )
-                
+
                 # 处理没有消息ID的结果 - 单条发送并附带图片
                 for idx, result in enumerate(without_message_id, len(with_message_id) + 1):
                     filename = os.path.basename(result['path'])
@@ -675,7 +839,7 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text=f"{idx}. 文件路径：<code>{filename}</code>",
                         parse_mode='HTML'
                     )
-                    
+
                     # 发送图片文件
                     try:
                         if os.path.exists(result['path']):
@@ -705,10 +869,35 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(help_text, parse_mode='HTML', reply_to_message_id=update.message.message_id)
 
 
+async def handle_find_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        await query.answer()
+        return
+
+    _, query_id, page_str = parts
+    if query_id == "noop":
+        await query.answer()
+        return
+
+    try:
+        page = int(page_str)
+    except ValueError:
+        await query.answer()
+        return
+
+    await query.answer()
+    await render_find_page(update, context, query_id, page, is_callback=True)
+
+
 async def ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     处理 /ocr 命令，立即对所有未OCR的图片进行OCR处理
-    
+
     与定时任务不同的是，/ocr 会一次性处理所有待处理的图片，
     不受 OCR_BATCH_SIZE 的限制（但内存允许的情况下）
     """
@@ -1738,6 +1927,7 @@ def create_application():
     app.add_error_handler(error_handler)
     
     # Add handlers - 新命令体系，首字母即可区分
+    app.add_handler(CallbackQueryHandler(handle_find_page_callback, pattern=r"^find_page:"))
     app.add_handler(CommandHandler('find', find_command))      # 搜索（替代search）
     app.add_handler(CommandHandler('ocr', ocr_command))        # OCR处理（替代forceOCR）
     app.add_handler(CommandHandler('tag', tag_command))        # 设置标签（替代setocr）
