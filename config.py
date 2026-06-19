@@ -45,6 +45,7 @@ SCHEDULER_COALESCE = True            # 合并延迟的任务执行，避免积�
 MAX_RESULTS = 5               # 搜索返回的最大结果数量（适用于图片搜索和文本搜索）
 FIND_PAGINATION_ENABLED = True  # /find 搜索结果是否启用分页
 FIND_PAGE_SIZE = 9              # /find 每页数量（1-9，超出将回退为9）
+RANDOM_DEFAULT_COUNT = 9        # /r 随机图片默认返回数量
 
 # -- 失败记录配置 --
 FAILED_OCR_DEFAULT_LIMIT = 5  # /failed 命令默认显示的失败记录数量

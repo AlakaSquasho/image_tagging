@@ -77,6 +77,7 @@ docker-compose up -d
 | 命令 | 快捷输入 | 功能 |
 |------|---------|------|
 | `/find` | `/f` | 搜索图片 |
+| `/r` | `/r` | 随机图片 |
 | `/ocr` | `/o` | OCR处理 |
 | `/tag` | `/t` | 设置标签 |
 | `/untag` | `/u` | 清除标签 |
@@ -132,6 +133,17 @@ docker-compose up -d
 /f -2 --contains 截图            # 内存遍历搜索，最多2个结果
 /f -n=3 --com 二维码             # 全面搜索二维码，最多3个结果
 ```
+
+---
+
+### 🎲 随机图片 - `/r`
+
+```
+/r                              # 使用默认数量随机发送图片
+/r 10                           # 随机发送10张图片
+```
+
+结果超过每页数量时会分页显示，并可点击“重新随机”重新抽取同样数量的图片。
 
 ---
 
@@ -232,6 +244,7 @@ OCR_MAX_RETRIES = 3                        # OCR 失败重试次数
 OCR_BATCH_SIZE = 5                         # 单次处理的最大图像数
 MAX_IMAGES_IN_DOWNLOAD_FOLDER = 300        # 自动归档阈值
 MAX_RESULTS = 5                            # 搜索返回的最大结果数
+RANDOM_DEFAULT_COUNT = 9                   # /r 默认随机图片数量
 FAILED_OCR_DEFAULT_LIMIT = 10              # /failed 默认显示的失败记录数
 ```
 

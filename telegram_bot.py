@@ -23,7 +23,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 from config import (BOT_TOKEN, ALLOWED_USER_ID, IMAGE_DOWNLOAD_PATH, DB_PATH, LOG_FILE_PATH,
                    MAX_IMAGES_IN_DOWNLOAD_FOLDER, OCR_SCHEDULED_TIME, OCR_MAX_RETRIES, OCR_BATCH_SIZE,
                    MAX_RESULTS, SCHEDULER_MISFIRE_GRACE_TIME, SCHEDULER_MAX_INSTANCES, SCHEDULER_COALESCE,
-                   FAILED_OCR_DEFAULT_LIMIT, FIND_PAGINATION_ENABLED, FIND_PAGE_SIZE)
+                   FAILED_OCR_DEFAULT_LIMIT, FIND_PAGINATION_ENABLED, FIND_PAGE_SIZE, RANDOM_DEFAULT_COUNT)
 from image_searcher import ImageSimilaritySearcher
 
 from typing import Dict, Optional, List, Tuple
@@ -91,19 +91,27 @@ def paginate_results(results: List[Dict], page: int, page_size: int) -> Tuple[Li
     return results[start:end], total_pages
 
 
-def build_find_keyboard(page: int, total_pages: int, query_id: str) -> Optional[InlineKeyboardMarkup]:
-    if total_pages <= 1:
+def build_find_keyboard(page: int, total_pages: int, query_id: str, state: Optional[Dict] = None) -> Optional[InlineKeyboardMarkup]:
+    keyboard_rows = []
+
+    if total_pages > 1:
+        prev_page = max(1, page - 1)
+        next_page = min(total_pages, page + 1)
+
+        keyboard_rows.append([
+            InlineKeyboardButton("上一页", callback_data=f"find_page:{query_id}:{prev_page}"),
+            InlineKeyboardButton(f"{page}/{total_pages}", callback_data="find_page:noop:0"),
+            InlineKeyboardButton("下一页", callback_data=f"find_page:{query_id}:{next_page}"),
+        ])
+
+    if state and state.get("mode") == "random":
+        keyboard_rows.append([
+            InlineKeyboardButton("重新随机", callback_data=f"find_random:{query_id}:reroll")
+        ])
+
+    if not keyboard_rows:
         return None
-
-    prev_page = max(1, page - 1)
-    next_page = min(total_pages, page + 1)
-
-    buttons = [
-        InlineKeyboardButton("上一页", callback_data=f"find_page:{query_id}:{prev_page}"),
-        InlineKeyboardButton(f"{page}/{total_pages}", callback_data="find_page:noop:0"),
-        InlineKeyboardButton("下一页", callback_data=f"find_page:{query_id}:{next_page}"),
-    ]
-    return InlineKeyboardMarkup([buttons])
+    return InlineKeyboardMarkup(keyboard_rows)
 
 
 def get_find_summary_text(state: Dict, page: int, total_pages: int) -> str:
@@ -114,11 +122,16 @@ def get_find_summary_text(state: Dict, page: int, total_pages: int) -> str:
 
 def build_find_summary_text(state: Dict, page: int, total_pages: int, page_results: List[Dict]) -> str:
     summary_text = get_find_summary_text(state, page, total_pages)
-    link_lines = [
-        result['telegram_message_id']
-        for result in page_results
-        if result.get('telegram_message_id')
-    ]
+    page_size = state.get("page_size", 9)
+    start_index = (page - 1) * page_size
+    link_lines = []
+
+    for index, result in enumerate(page_results, start=start_index + 1):
+        if result.get('telegram_message_id'):
+            link_lines.append(f"{index}. 原始链接/消息ID：{result['telegram_message_id']}")
+        else:
+            link_lines.append(f"{index}. 无原始链接信息")
+
     if link_lines:
         summary_text = f"{summary_text}\n\n" + "\n".join(link_lines)
     return summary_text
@@ -143,7 +156,7 @@ async def render_find_page(
     page_results, total_pages = paginate_results(results, page, page_size)
     page = min(max(page, 1), total_pages)
 
-    keyboard = build_find_keyboard(page, total_pages, query_id)
+    keyboard = build_find_keyboard(page, total_pages, query_id, state)
     summary_text = build_find_summary_text(state, page, total_pages, page_results)
 
     chat_id = update.effective_chat.id
@@ -879,19 +892,88 @@ async def handle_find_page_callback(update: Update, context: ContextTypes.DEFAUL
         await query.answer()
         return
 
-    _, query_id, page_str = parts
+    action, query_id, value = parts
     if query_id == "noop":
         await query.answer()
         return
 
+    if action == "find_random" and value == "reroll":
+        state = context.user_data.get("find_pagination", {}).get(query_id)
+        if not state or state.get("mode") != "random":
+            await query.answer("随机结果已失效，请重新发送 /r。", show_alert=False)
+            return
+
+        requested_count = state.get("requested_count", RANDOM_DEFAULT_COUNT)
+        results = searcher.get_random_images(requested_count)
+        if not results:
+            await query.answer("没有可随机的图片。", show_alert=False)
+            return
+
+        state["results"] = results
+        state["summary"] = f"随机抽取 {len(results)} 张图片:"
+        await query.answer("已重新随机")
+        await render_find_page(update, context, query_id, 1, is_callback=True)
+        return
+
     try:
-        page = int(page_str)
+        page = int(value)
     except ValueError:
         await query.answer()
         return
 
     await query.answer()
     await render_find_page(update, context, query_id, page, is_callback=True)
+
+
+async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 /r 命令，随机发送若干已索引图片"""
+    logger.info(f"🎲 Received /r command from user {update.message.from_user.id}")
+
+    if update.message.from_user.id != ALLOWED_USER_ID:
+        logger.warning(f"❌ Unauthorized user {update.message.from_user.id} tried to interact with /r.")
+        return
+
+    requested_count = RANDOM_DEFAULT_COUNT
+    if context.args:
+        if len(context.args) != 1:
+            await update.message.reply_text(
+                "用法：/r 或 /r 数量，例如 /r 10",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+        try:
+            requested_count = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "随机数量必须是正整数，例如 /r 10",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+    if requested_count <= 0:
+        await update.message.reply_text(
+            "随机数量必须大于0，例如 /r 10",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+
+    results = searcher.get_random_images(requested_count)
+    if not results:
+        await update.message.reply_text("当前没有可随机的图片记录。", reply_to_message_id=update.message.message_id)
+        return
+
+    query_id = str(uuid4())
+    page_size = get_find_page_size()
+    context.user_data.setdefault("find_pagination", {})[query_id] = {
+        "results": results,
+        "mode": "random",
+        "page_size": page_size,
+        "requested_count": requested_count,
+        "summary": f"随机抽取 {len(results)} 张图片:",
+        "message_ids": []
+    }
+    await render_find_page(update, context, query_id, 1, is_callback=False)
 
 
 async def ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1927,8 +2009,9 @@ def create_application():
     app.add_error_handler(error_handler)
     
     # Add handlers - 新命令体系，首字母即可区分
-    app.add_handler(CallbackQueryHandler(handle_find_page_callback, pattern=r"^find_page:"))
+    app.add_handler(CallbackQueryHandler(handle_find_page_callback, pattern=r"^(find_page|find_random):"))
     app.add_handler(CommandHandler('find', find_command))      # 搜索（替代search）
+    app.add_handler(CommandHandler('r', random_command))       # 随机图片
     app.add_handler(CommandHandler('ocr', ocr_command))        # OCR处理（替代forceOCR）
     app.add_handler(CommandHandler('tag', tag_command))        # 设置标签（替代setocr）
     app.add_handler(CommandHandler('untag', untag_command))    # 清除标签（替代clearocr）

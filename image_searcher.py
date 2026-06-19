@@ -688,6 +688,46 @@ class ImageSimilaritySearcher:
                 self.logger.error(f"Failed to get failed OCR count: {e}")
                 return 0
 
+    def get_random_images(self, limit: int) -> List[Dict]:
+        """
+        随机获取已索引图片记录。
+
+        Args:
+            limit: 返回的最大记录数
+
+        Returns:
+            与搜索结果兼容的字典列表
+        """
+        if limit <= 0:
+            return []
+
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    SELECT file_path, telegram_message_id, file_hash, updated_time, ocr_text
+                    FROM image_features
+                    WHERE file_path IS NOT NULL AND file_path != ''
+                    ORDER BY RANDOM()
+                    LIMIT ?
+                ''', (limit,))
+
+                results = []
+                for row in cursor.fetchall():
+                    results.append({
+                        'path': row[0],
+                        'telegram_message_id': row[1],
+                        'file_hash': row[2],
+                        'updated_time': row[3],
+                        'ocr_text': row[4],
+                        'search_method': 'RANDOM'
+                    })
+                self.logger.info(f"Random image query requested {limit}, returned {len(results)} results")
+                return results
+            except Exception as e:
+                self.logger.error(f"Failed to get random images: {e}")
+                return []
+
     def get_failed_ocr_records(self, limit: Optional[int] = None) -> List[Dict]:
         """
         获取OCR失败的记录列表
