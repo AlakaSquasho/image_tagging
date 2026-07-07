@@ -1,329 +1,105 @@
-# Bot 命令参考手册
+# Bot Command Reference
 
-## 命令重构说明
+[中文说明 / Chinese Version](./COMMANDS_zh.md)
 
-为了提高输入效率，所有命令已重新设计，确保**首字母或前2个字母即可区分**。
+## Command List
 
-### 新旧命令对照表
+- `/find <keyword>`: search images by OCR text
+- `reply to an image with /find`: search by image
+- `/r [count]`: send random images
+- `/ocr`: process pending OCR images
+- `reply to an image with /tag <text>`: set OCR text manually
+- `reply to an image with /untag`: clear OCR text and reset it to pending
+- `reply to an image with /link <message id or link>`: attach a message ID to an image without one
+- `reply to an image with /getocr`: view the current OCR text of an image
+- `/failed`: view failed OCR records
 
-| 旧命令 | 新命令 | 说明 | 首字母 |
-|--------|--------|------|--------|
-| `/search` | `/find` | 搜索图片（文本/图片） | `f` |
-| `/forceOCR` | `/ocr` | 强制OCR处理 | `o` |
-| `/setocr` | `/tag` | 设置OCR标签 | `t` |
-| `/clearocr` | `/untag` | 清除OCR标签 | `u` |
-| _（新增）_ | `/link` | 设置消息ID | `l` |
-| _（新增）_ | `/r` | 随机图片 | `r` |
-| _（新增）_ | `/failed` | 查看OCR失败记录 | `fa` |
+## `/find`
 
----
+Text search:
 
-## 详细命令说明
-
-### 1. `/find` - 搜索命令
-
-**功能：** 通过文本或图片搜索已索引的图片
-
-#### 用法一：文本搜索
-
-```
-/find <关键词>
+```text
+/find keyword
+/find --comprehensive keyword
+/find --com keyword
+/find --contains keyword
+/find -5 keyword
+/find -n=5 keyword
+/find --max=10 keyword
 ```
 
-**参数选项：**
-- 默认（精确匹配模式）：`/find 猫咪` - 直接使用关键词进行匹配，不分词
-- `--comprehensive` 或 `--com`：全面搜索，包含关键词+分词结果 `/find --com 猫咪`
-- `--contains`：内存遍历搜索，最准确但可能较慢 `/find --contains 猫咪`
-- `-5` 或 `-n=5`：限制返回5个结果 `/find -5 猫咪`
+Notes:
 
-#### 用法二：图片搜索
+- Default mode: exact match
+- `--comprehensive` / `--com`: full keyword + tokenized search
+- `--contains`: search OCR text by substring match
+- `-5`, `-n=5`, `--max=10`: limit the number of results
 
-回复一张图片并发送 `/find`
+Image search:
 
----
-
-### 2. `/ocr` - OCR处理命令
-
-**功能：** 立即对所有待处理的图片进行OCR识别
-
-#### 用法
-
+```text
+[reply to an image] /find
 ```
+
+## `/r`
+
+```text
+/r
+/r 10
+```
+
+- Uses the default count from `config.py` when no count is provided
+- Results may be paginated when there are too many images
+
+## `/ocr`
+
+```text
 /ocr
 ```
 
-**说明：**
-- 一次性处理所有pending状态的图片
-- 会显示实时进度条
-- 处理完成后显示详细统计信息
+- Processes all pending OCR images and retryable failed images
 
----
+## `/tag`
 
-### 3. `/tag` - 设置OCR标签
-
-**功能：** 手动为图片设置OCR文本（支持没有消息ID的图片）
-
-#### 用法
-
-回复一张图片并发送：
-```
-/tag <OCR文本内容>
+```text
+[reply to an image] /tag OCR text content
 ```
 
-**示例：**
-```
-/tag 猫咪 可爱 薛条
-```
+- Manually sets the OCR text for an image
 
-**说明：**
-- 可以为任何已索引的图片设置OCR文本
-- 即使图片没有消息ID也可以设置
-- 会自动清理和规范化文本
+## `/untag`
 
----
-
-### 4. `/untag` - 清除OCR标签
-
-**功能：** 清除图片的OCR识别结果，重置为待处理状态
-
-#### 用法
-
-回复一张图片并发送：
-```
-/untag
+```text
+[reply to an image] /untag
 ```
 
-**说明：**
-- 清除后图片的OCR状态会重置为pending
-- 可在下次定时任务或手动OCR时重新识别
+- Clears OCR text
+- Resets the image status to pending
 
----
+## `/link`
 
-### 5. `/link` - 设置消息ID（新命令）
-
-**功能：** 为图片设置Telegram消息ID或链接
-
-#### 用法
-
-回复一张图片并发送：
-```
-/link <消息ID或链接>
+```text
+[reply to an image] /link message_id_or_link
 ```
 
-**示例：**
-```
-/link https://t.me/channel_name/12345
-```
+- Only works for images that do not already have a message ID
 
-**限制：**
-- 仅适用于**没有消息ID**的图片
-- 已有消息ID的图片无法覆盖
+## `/getocr`
 
----
-
-### 6. `/r` - 随机图片（新命令）
-
-**功能：** 从现有索引记录中随机抽取若干图片发送
-
-#### 用法
-
-```
-/r              # 使用默认数量随机发送图片
-/r 10           # 随机发送10张图片
+```text
+[reply to an image] /getocr
 ```
 
-**说明：**
-- 默认数量可在 `config.py` 中配置 `RANDOM_DEFAULT_COUNT`
-- 结果超过每页数量时分页显示
-- 可点击“重新随机”按钮，清除当前结果并按相同数量重新抽取
+- Shows the currently stored OCR text for the image
 
----
+## `/failed`
 
-### 7. `/failed` - 查看OCR失败记录（新命令）
-
-**功能：** 查看OCR识别失败的图片记录，通过回复历史消息的方式展示
-
-#### 用法
-
-```
-/failed              # 显示默认数量的失败记录
-/failed -5           # 显示前5条失败记录
-/failed -a           # 显示所有失败记录
-/failed -all         # 显示所有失败记录
-```
-
-**交互方式：**
-1. Bot 首先发送概要信息（总数/显示数量）
-2. 然后逐条发送消息，每条消息都会**回复对应的原图片消息**
-3. 用户可以**点击引用/回复部分直接跳转到原图片**
-4. 最后发送完成统计
-
-**每条记录显示内容：**
-- 记录序号
-- 失败次数
-- 更新时间
-- 操作提示（回复图片使用 /tag 设置标签）
-
-**说明：**
-- 默认显示数量可在 `config.py` 中配置 `FAILED_OCR_DEFAULT_LIMIT`
-- 如果原消息已被删除，Bot 会显示无法定位的提示
-- 发送间隔有短暂延迟（0.3秒），避免 Telegram 限流
-- 点击 Bot 发送的消息中的"引用"部分即可跳转到对应的图片
-
----
-
-## 命令快速输入对比
-
-### 旧命令体系的问题
-
-```
-/search...    → 需要输入 /sea 才能区分
-/setocr...    → 需要输入 /set 才能区分
-/forceOCR...  → 需要输入完整命令
-```
-
-### 新命令体系的优势
-
-```
-/f...     → 唯一匹配 /find      （1个字母）
-/o...     → 唯一匹配 /ocr       （1个字母）
-/t...     → 唯一匹配 /tag       （1个字母）
-/u...     → 唯一匹配 /untag     （1个字母）
-/l...     → 唯一匹配 /link      （1个字母）
-/fa...    → 唯一匹配 /failed    （2个字母）
-```
-
-**效率提升：** 所有命令仅需输入**首字母+空格**即可自动补全！
-
----
-
-## 图片处理流程
-
-### 接收图片时
-
-1. 自动检查是否重复（通过文件哈希和感知哈希）
-2. 如果图片caption是 `/find`，则执行图片搜索
-3. 否则添加到索引，OCR标记为pending状态
-
-### OCR处理
-
-1. **自动处理：** 每天凌晨4点自动执行定时任务
-2. **手动处理：** 使用 `/ocr` 命令立即处理
-3. **手动标注：** 使用 `/tag` 命令手动设置OCR文本
-
-### 搜索方式
-
-1. **文本搜索：** `/find 关键词` - 在OCR文本中搜索
-2. **图片搜索：** 回复图片 + `/find` - 通过图片相似度搜索
-
----
-
-## 常见使用场景
-
-### 场景1：快速搜索猫咪图片
-```
-/f 猫咪
-```
-
-### 场景2：手动标注图片
-```
-（回复图片）
-/t 猫咪 可爱 白色
-```
-
-### 场景3：为旧图片补充消息链接
-```
-（回复图片）
-/l https://t.me/mychannel/123
-```
-
-### 场景4：批量处理待OCR图片
-```
-/o
-```
-
-### 场景5：查看OCR失败的图片
-```
+```text
 /failed
+/failed -5
+/failed -a
+/failed -all
 ```
 
-### 场景6：为失败的图片手动设置标签
-```
-（查看失败记录后，找到对应图片回复）
-/t 图片描述内容
-```
-
----
-
-## 技术说明
-
-- **OCR引擎：** PaddleOCR（懒加载模式，用完即释放）或 Mac 快捷指令
-- **相似度检测：** 感知哈希（Perceptual Hash）
-- **文本搜索：** FTS5全文搜索 + 模糊匹配
-- **内存优化：** 每批处理后自动垃圾回收
-
----
-
-## Mac 快捷指令 OCR 配置
-
-### 配置说明
-
-在 `config.py` 中设置：
-
-```python
-# Mac 快捷指令 OCR 配置
-MAC_SHORTCUTS = "ocr-file"    # 快捷指令名称
-                              # 不为空时使用 Mac 快捷指令进行 OCR
-                              # 设置为 "" 或 None 则使用 PaddleOCR
-```
-
-### 快捷指令要求
-
-1. 快捷指令需要接收图片文件作为输入
-2. 使用“识别文字”动作提取图片中的文字
-3. 将识别结果复制到剪切板
-4. 命令行用法：`shortcuts run <快捷指令名称> -i <图片路径>`
-
-### 工作原理
-
-1. 系统调用 `shortcuts run` 命令执行快捷指令
-2. 监听剪切板变化（轮询间隔 0.3 秒）
-3. 检测到剪切板内容变化后，获取 OCR 结果
-4. 对结果进行后处理（去重、过滤）
-
----
-
-## OCR 后处理配置
-
-### 配置说明
-
-在 `config.py` 中设置正则表达式列表：
-
-```python
-OCR_POST_FILTER_PATTERNS = [
-    r'^\s*$',                 # 空行或只有空白字符的行
-    r'^[\d\s]+$',             # 只有数字和空白的行
-    r'^[^\w\u4e00-\u9fff]+$', # 只有符号的行（不包含字母、数字、中文）
-]
-```
-
-### 处理流程
-
-1. **去重**：移除重复的文本行
-2. **过滤空行**：移除空白行
-3. **正则过滤**：根据配置的正则表达式过滤匹配的行
-
-### 自定义过滤规则
-
-可以根据需要添加自定义正则表达式：
-
-```python
-OCR_POST_FILTER_PATTERNS = [
-    r'^\s*$',                 # 空行
-    r'^[\d\s]+$',             # 纯数字
-    r'^[^\w\u4e00-\u9fff]+$', # 纯符号
-    r'^\d{1,2}$',             # 1-2位数字（如页码）
-    r'^Page\s*\d+$',          # "Page 1" 格式的页码
-    r'^\[.*\]$',              # 方括号包围的内容
-]
-```
+- Shows failed OCR records
+- `-a` / `-all` shows all records
