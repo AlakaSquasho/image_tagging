@@ -65,13 +65,15 @@ docker-compose down
 - `回复图片 /link 消息ID或链接`：补充消息 ID
 - `/getocr`：查看图片 OCR 文本
 - `/failed`：查看 OCR 失败记录
+- `/help`：以 Markdown 形式输出当前语言对应的命令说明
+- `/language <zh|en>` 或 `/lang <zh|en>`：在中文和英文之间切换 bot 输出语言
 
 详细命令说明见 `COMMANDS.md`。
 
 ## 常用检查命令
 
 ```bash
-python -m py_compile telegram_bot.py image_searcher.py config.py
+python -m py_compile telegram_bot.py image_searcher.py config.py i18n.py
 docker-compose logs -f
 ```
 

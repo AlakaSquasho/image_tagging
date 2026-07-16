@@ -13,6 +13,8 @@
 - `reply to an image with /link <message id or link>`: attach a message ID to an image without one
 - `reply to an image with /getocr`: view the current OCR text of an image
 - `/failed`: view failed OCR records
+- `/help`: output the localized command reference in Markdown (`COMMANDS_zh.md` for Chinese, otherwise `COMMANDS.md`)
+- `/language <zh|en>` or `/lang <zh|en>`: switch the bot output language between Chinese and English
 
 ## `/find`
 
@@ -103,3 +105,28 @@ Image search:
 
 - Shows failed OCR records
 - `-a` / `-all` shows all records
+
+## `/help`
+
+```text
+/help
+```
+
+- Sends the command reference as Markdown
+- Uses `COMMANDS_zh.md` when the current bot language is Chinese (`zh`)
+- Falls back to `COMMANDS.md` for other languages or when no localized file exists
+
+## `/language` and `/lang`
+
+```text
+/language
+/language zh
+/language en
+/lang
+/lang zh
+/lang en
+```
+
+- Shows the current bot output language when used without arguments
+- Supports `zh` and `en`
+- `/lang` is a short alias for `/language`

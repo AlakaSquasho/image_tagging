@@ -67,13 +67,15 @@ docker-compose down
 - `reply to an image with /link <message id or link>`: attach a message ID
 - `/getocr`: view OCR text for an image
 - `/failed`: view failed OCR records
+- `/help`: output the localized command reference in Markdown
+- `/language <zh|en>` or `/lang <zh|en>`: switch the bot output language between Chinese and English
 
 See `COMMANDS.md` for detailed command usage.
 
 ## Useful Checks
 
 ```bash
-python -m py_compile telegram_bot.py image_searcher.py config.py
+python -m py_compile telegram_bot.py image_searcher.py config.py i18n.py
 docker-compose logs -f
 ```
 

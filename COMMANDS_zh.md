@@ -11,6 +11,8 @@
 - `回复图片 /link <消息ID或链接>`：为没有消息 ID 的图片补充消息 ID
 - `回复图片 /getocr`：查看图片当前 OCR 文本
 - `/failed`：查看 OCR 失败记录
+- `/help`：以 Markdown 形式输出当前语言对应的命令说明（中文优先 `COMMANDS_zh.md`，否则回退 `COMMANDS.md`）
+- `/language <zh|en>` 或 `/lang <zh|en>`：在中文和英文之间切换 bot 输出语言
 
 ## `/find`
 
@@ -101,3 +103,28 @@
 
 - 查看 OCR 失败记录
 - `-a` / `-all` 表示显示全部
+
+## `/help`
+
+```text
+/help
+```
+
+- 以 Markdown 形式发送命令说明
+- 当前 bot 语言为中文（`zh`）时使用 `COMMANDS_zh.md`
+- 其他语言或没有对应本地化文件时回退到 `COMMANDS.md`
+
+## `/language` 和 `/lang`
+
+```text
+/language
+/language zh
+/language en
+/lang
+/lang zh
+/lang en
+```
+
+- 不带参数时显示当前 bot 输出语言
+- 目前支持 `zh` 和 `en`
+- `/lang` 是 `/language` 的简写

@@ -15,6 +15,7 @@ import imagehash
 import jieba
 import opencc
 
+# 配置与 OCR 后端选择
 # 尝试导入配置
 try:
     import config
@@ -24,56 +25,52 @@ except ImportError:
     MAC_SHORTCUTS = None
     OCR_POST_FILTER_PATTERNS = []
 
-# 根据配置决定是否导入 PaddleOCR
-# 只有在非 Mac 或未配置快捷指令时才需要 PaddleOCR
 if not MAC_SHORTCUTS or platform.system() != 'Darwin':
     from paddleocr import PaddleOCR
 else:
     PaddleOCR = None
+
 
 class ImageSimilaritySearcher:
     """图像相似性搜索器 - Bot专用版"""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        # 使用线程锁保护数据库操作，避免并发问题
         self._db_lock = threading.RLock()
-        # 每个线程使用独立的数据库连接
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0) 
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         self.logger = logging.getLogger(__name__)
         self._init_database()
-        
-        # OCR引擎采用懒加载模式，不在初始化时加载
+
+        # OCR 引擎采用懒加载，只有真正执行 OCR 时才初始化。
         self.ocr_engine = None
         self.logger.info("ImageSimilaritySearcher initialized with lazy-loading OCR engine.")
-        
-        # 初始化中文分词器
+
+        # 初始化中文分词能力，供综合文本搜索使用。
         try:
             jieba.initialize()
             self.logger.info("Jieba Chinese tokenizer initialized.")
         except Exception as e:
             self.logger.warning(f"Failed to initialize Jieba: {e}. Chinese text segmentation may not work optimally.")
-        
-        # 初始化简繁转换器
+
+        # 初始化简繁转换器，支持简繁体互查。
         try:
             self.cc_s2t = opencc.OpenCC('s2t')  # 简体转繁体
             self.cc_t2s = opencc.OpenCC('t2s')  # 繁体转简体
             self.logger.info("OpenCC simplified-traditional Chinese converters initialized.")
         except Exception as e:
             self.logger.warning(f"Failed to initialize OpenCC: {e}. Simplified-traditional conversion may not work.")
-        
-        # 初始化OCR文本内存缓存，用于高效的字符串包含搜索
+
+        # 已完成 OCR 的文本会常驻内存，提升 contains 搜索速度。
         self._ocr_cache = {}  # {file_path: ocr_text}
         self._cache_lock = threading.RLock()
         self._load_ocr_cache()
         self.logger.info(f"OCR text cache initialized with {len(self._ocr_cache)} entries.")
 
     def _ensure_ocr_engine(self):
-        """确保OCR引擎已加载（懒加载模式）"""
-        # 如果使用 Mac 快捷指令，则不需要 PaddleOCR
+        """确保 OCR 引擎已加载（懒加载模式）"""
         if self._use_mac_shortcuts():
             return
-        
+
         if self.ocr_engine is None:
             try:
                 self.logger.info("Loading OCR engine on demand...")
@@ -84,13 +81,13 @@ class ImageSimilaritySearcher:
             except Exception as e:
                 self.logger.error(f"Failed to load OCR engine: {e}")
                 raise
-    
+
     def _use_mac_shortcuts(self) -> bool:
         """判断是否使用 Mac 快捷指令进行 OCR"""
         return bool(MAC_SHORTCUTS) and platform.system() == 'Darwin'
     
     def _load_ocr_cache(self):
-        """从数据库加载所有OCR文本到内存缓存"""
+        """从数据库加载所有已完成 OCR 文本到内存缓存。"""
         with self._db_lock:
             cursor = self.conn.cursor()
             try:
@@ -103,7 +100,7 @@ class ImageSimilaritySearcher:
             except Exception as e:
                 self.logger.error(f"Failed to load OCR cache: {e}")
                 self._ocr_cache = {}
-    
+
     def _update_ocr_cache(self, file_path: str, ocr_text: str):
         """更新内存缓存中的OCR文本"""
         with self._cache_lock:
@@ -139,50 +136,36 @@ class ImageSimilaritySearcher:
     
     def _post_process_ocr_text(self, text_lines: List[str]) -> List[str]:
         """
-        OCR后处理：去重、过滤空行、只有数字的行、只有符号的行等
-        
-        Args:
-            text_lines: 文本行列表
-        
-        Returns:
-            处理后的文本行列表
+        OCR 后处理：去重、过滤空行，以及仅数字或仅符号等噪声行。
         """
         if not text_lines:
             return []
-        
-        # 编译正则表达式
+
         compiled_patterns = [re.compile(pattern) for pattern in OCR_POST_FILTER_PATTERNS]
-        
         seen = set()
         result = []
-        
+
         for line in text_lines:
-            # 去除首尾空白
             line = line.strip()
-            
-            # 跳过空行
             if not line:
                 continue
-            
-            # 去重
             if line in seen:
                 continue
-            
-            # 检查是否匹配任何过滤正则
+
             should_filter = False
             for pattern in compiled_patterns:
                 if pattern.match(line):
                     should_filter = True
                     break
-            
+
             if should_filter:
                 continue
-            
+
             seen.add(line)
             result.append(line)
-        
+
         return result
-    
+
     def _extract_text_mac_shortcuts(self, image_path: str, timeout: int = 3) -> str:
         """
         使用 Mac 快捷指令进行 OCR 识别
@@ -197,15 +180,11 @@ class ImageSimilaritySearcher:
         if not os.path.exists(image_path):
             self.logger.error(f"Image file not found: {image_path}")
             return ""
-        
-        # 获取绝对路径
+
         abs_path = os.path.abspath(image_path)
-        
-        # 获取执行前的剪切板内容
         old_clipboard = self._get_clipboard_content()
-        
+
         try:
-            # 调用快捷指令
             self.logger.info(f"Running Mac shortcut '{MAC_SHORTCUTS}' for {abs_path}")
             subprocess.run(
                 ['shortcuts', 'run', MAC_SHORTCUTS, '-i', abs_path],
@@ -213,19 +192,17 @@ class ImageSimilaritySearcher:
                 text=True,
                 timeout=timeout
             )
-            
-            # 监听剪切板变化
+
             start_time = time.time()
-            poll_interval = 0.3  # 轮询间隔
-            
+            poll_interval = 0.3
+
+            # 快捷指令将结果写入剪贴板，这里轮询等待内容变化。
             while time.time() - start_time < timeout:
                 current_clipboard = self._get_clipboard_content()
                 if current_clipboard != old_clipboard:
-                    # 剪切板内容变化，说明 OCR 完成
                     text_lines = current_clipboard.split('\n')
                     processed_lines = self._post_process_ocr_text(text_lines)
                     result_text = ' '.join(processed_lines)
-                    # 清理文本
                     cleaned_text = self._clean_text(result_text)
                     self.logger.info(f"Mac shortcuts OCR completed for {abs_path}: {len(cleaned_text)} chars")
                     return cleaned_text
@@ -252,21 +229,17 @@ class ImageSimilaritySearcher:
         if not text or not isinstance(text, str):
             return ""
         
-        # 1. 先移除换行符和制表符，替换为空格
         text = re.sub(r'[\r\n\t]+', ' ', text)
         
-        # 2. 移除多余的空白字符
         text = re.sub(r'\s+', ' ', text.strip())
         
-        # 3. 移除常见的OCR噪声字符
-        # 移除特殊符号、标点（保留中英文字符、数字）
         text = re.sub(r'[^\u4e00-\u9fff\w\s]', '', text)
         
-        # 4. 再次清理空格
         text = re.sub(r'\s+', ' ', text.strip())
         
         return text
     
+    # OCR 文本标准化与数据库初始化
     def _normalize_query_text(self, text: str) -> str:
         """
         规范化查询文本，确保与数据库中的清理后文本格式一致。
@@ -274,8 +247,10 @@ class ImageSimilaritySearcher:
         return self._clean_text(text)
 
     def _init_database(self):
-        """初始化数据库"""
+        """初始化数据库结构与搜索相关索引。"""
         cursor = self.conn.cursor()
+
+        # 主表：保存图片路径、哈希、OCR 文本与 Telegram 关联信息。
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS image_features (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -292,7 +267,16 @@ class ImageSimilaritySearcher:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_hash ON image_features(file_hash)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_phash ON image_features(phash)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_ocr_status ON image_features(ocr_status)')
-        
+
+        # 用户偏好表：目前用于保存语言设置。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id INTEGER PRIMARY KEY,
+                language TEXT NOT NULL,
+                updated_time REAL NOT NULL
+            )
+        ''')
+
         # FTS5 for full-text search on OCR text
         cursor.execute('CREATE VIRTUAL TABLE IF NOT EXISTS image_text_search USING fts5(file_path, ocr_text, content="image_features", content_rowid="id")')
         
@@ -316,8 +300,34 @@ class ImageSimilaritySearcher:
         self.conn.commit()
         self.logger.info("Database initialized successfully.")
 
+    # 用户偏好
+    def get_user_language(self, user_id: int) -> Optional[str]:
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT language FROM user_preferences WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+    def set_user_language(self, user_id: int, language: str) -> None:
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                '''
+                INSERT INTO user_preferences (user_id, language, updated_time)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    language = excluded.language,
+                    updated_time = excluded.updated_time
+                ''',
+                (user_id, language, time.time()),
+            )
+            self.conn.commit()
+
     def _get_file_hash(self, file_path: str) -> str:
-        """计算文件的MD5哈希值"""
+        """计算文件的 MD5 哈希值。"""
         hash_md5 = hashlib.md5()
         try:
             with open(file_path, "rb") as f:
@@ -329,57 +339,49 @@ class ImageSimilaritySearcher:
             raise
 
     def _extract_text_from_image(self, image_path: str) -> str:
-        """从图片中提取文本，根据配置选择 Mac 快捷指令或 PaddleOCR"""
-        # 检查是否使用 Mac 快捷指令
+        """从图片中提取文本，并按配置选择 OCR 后端。"""
         if self._use_mac_shortcuts():
             return self._extract_text_mac_shortcuts(image_path)
-        
-        # 懒加载：在实际需要OCR时才加载引擎
+
         self._ensure_ocr_engine()
-        
+
         if self.ocr_engine is None:
             self.logger.error(f"OCR engine failed to load")
             return ""
-        
+
         result = None
         texts = []
-        
+
         try:
-            # PaddleOCR API - 直接调用，不使用任何特殊参数
             result = self.ocr_engine.ocr(image_path)
-            
+
             if not result or not result[0]:
                 return ""
-            
+
             for line in result:
-                # 处理新格式：result 是字典，包含 'rec_texts' 和 'rec_scores'
+                # PaddleOCR 可能返回 dict 结构，也可能返回嵌套 list 结构。
                 if isinstance(line, dict):
                     rec_texts = line.get('rec_texts', [])
                     rec_scores = line.get('rec_scores', [])
-                    
+
                     for text, score in zip(rec_texts, rec_scores):
-                        # 确保 score 是浮点数，处理可能的字符串格式
                         try:
                             score_float = float(score) if isinstance(score, str) else score
                         except (ValueError, TypeError):
                             score_float = 0.0
-                        
-                        # 过滤掉空文本和低置信度的结果
+
                         if text and text.strip() and score_float > 0.6:
                             texts.append(text.strip())
-                # 处理旧格式：result 是列表的列表
                 elif isinstance(line, list):
                     for subline in line:
                         if isinstance(subline, list):
                             for word_info in subline:
-                                # word_info 结构: ((x1, y1), (x2, y2), (x3, y3), (x4, y4)), (text, confidence)
                                 if isinstance(word_info, (list, tuple)) and len(word_info) >= 2:
                                     text = word_info[1][0]
                                     score = word_info[1][1]
                                     if score > 0.6:
                                         texts.append(text)
-            
-            # 合并文本并清理
+
             raw_text = ' '.join(texts)
             cleaned_text = self._clean_text(raw_text)
             return cleaned_text
@@ -387,10 +389,8 @@ class ImageSimilaritySearcher:
             self.logger.error(f"OCR failed for {image_path}: {e}")
             return ""
         finally:
-            # 显式释放OCR结果占用的内存
             del result
             del texts
-            # 触发垃圾回收，清理OCR产生的临时对象
             gc.collect()
 
     def _tokenize_text(self, text: str) -> List[str]:
@@ -401,10 +401,8 @@ class ImageSimilaritySearcher:
         try:
             if not text or not isinstance(text, str):
                 return []
-            
-            # 使用 jieba 进行分词
+
             tokens = jieba.cut(text.strip())
-            # 过滤：移除长度 < 2 的词汇，这些通常是无意义的字符
             keywords = [token for token in tokens if len(token.strip()) >= 2 and token.strip()]
             return keywords
         except Exception as e:
@@ -425,13 +423,11 @@ class ImageSimilaritySearcher:
         try:
             all_variants = []
             for keyword in keywords:
-                all_variants.append(keyword)  # 保留原文本
+                all_variants.append(keyword)
                 try:
-                    # 转换为繁体，再转换回简体，如果有变化说明是简体，生成繁体
                     simplified = self.cc_t2s.convert(keyword)
                     traditional = self.cc_s2t.convert(keyword)
-                    
-                    # 添加转换后的版本（避免重复）
+
                     if traditional != keyword and traditional not in all_variants:
                         all_variants.append(traditional)
                     if simplified != keyword and simplified not in all_variants:
@@ -466,13 +462,13 @@ class ImageSimilaritySearcher:
             self.logger.error(f"Feature extraction failed for {image_path}: {e}")
             return None
         finally:
-            # 确保图像对象被正确关闭，释放内存
             if img is not None:
                 try:
                     img.close()
                 except Exception as e:
                     self.logger.debug(f"Failed to close image: {e}")
 
+    # 图片索引与 OCR 状态管理
     def add_image_to_index(self, file_path: str, telegram_message_id: str) -> bool:
         """
         添加单个文件的索引，包含Telegram消息ID。
@@ -504,71 +500,64 @@ class ImageSimilaritySearcher:
 
     def process_ocr_pending_images(self, batch_size: int = 10, max_retries: int = 3) -> Dict[str, int]:
         """
-        处理所有OCR状态为pending或failed的图片。
+        处理所有 OCR 状态为 pending 或可重试 failed 的图片。
         batch_size: 单次处理的最大图片数量
         max_retries: 最大重试次数（超过此次数的失败图片将被跳过）
         返回处理统计信息：{'processed': 5, 'succeeded': 4, 'failed': 1, 'skipped': 0}
         """
         stats = {'processed': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0}
-        
+
         try:
-            # 获取待处理的图片（使用锁保护）
             with self._db_lock:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                    SELECT id, file_path FROM image_features 
+                    SELECT id, file_path FROM image_features
                     WHERE (ocr_status = 'pending' OR (ocr_status = 'failed' AND ocr_fail_count < ?))
                     LIMIT ?
                 ''', (max_retries, batch_size))
-                
+
                 pending_images = cursor.fetchall()
                 cursor.close()
-            
+
             if not pending_images:
                 self.logger.info("No pending images for OCR processing.")
                 return stats
-            
+
             self.logger.info(f"Processing {len(pending_images)} images for OCR...")
-            
-            # 如果不使用 Mac 快捷指令，在处理前确保OCR引擎已加载
             if not self._use_mac_shortcuts():
                 self._ensure_ocr_engine()
-            
+
             for img_id, file_path in pending_images:
                 if not os.path.exists(file_path):
                     self.logger.warning(f"Image file not found: {file_path}. Marking as skipped.")
                     self._mark_ocr_skipped(img_id)
                     stats['skipped'] += 1
                     continue
-                
+
                 stats['processed'] += 1
                 try:
-                    # 检查文件大小
                     file_size = os.path.getsize(file_path)
                     if file_size == 0:
                         self.logger.warning(f"Image file is empty: {file_path}. Marking as skipped.")
                         self._mark_ocr_skipped(img_id)
                         stats['skipped'] += 1
                         continue
-                    
-                    # 获取当前数据库中的 OCR 文本
+
+                    # 已有人工修正或历史有效 OCR 时，避免空结果覆盖已有文本。
                     db_ocr_text = self._get_ocr_text_by_id(img_id)
-                    
                     self.logger.debug(f"Processing OCR for {file_path} (id: {img_id})...")
                     ocr_text = self._extract_text_from_image(file_path)
-                    
+
                     if ocr_text and not db_ocr_text:
-                        # 识别结果不为空且数据库中无内容，更新数据库
                         self._update_ocr_result(img_id, ocr_text, 'completed', 0)
                         stats['succeeded'] += 1
                         self.logger.info(f"Successfully processed OCR for {file_path}")
                     elif db_ocr_text:
-                        # 识别结果为空，但数据库有内容，跳过（保留原有内容）
+                        # Empty reruns should not overwrite previously usable OCR text.
                         self._update_ocr_result(img_id, db_ocr_text, 'completed', 0)
                         stats['skipped'] += 1
                         self.logger.info(f"Skipped OCR for {file_path}: keeping existing text ({len(db_ocr_text)} chars)")
                     else:
-                        # 识别结果为空且数据库也为空，标记为失败
                         self._increment_ocr_fail_count(img_id)
                         stats['failed'] += 1
                         self.logger.warning(f"OCR result empty for {file_path}, marked as failed")
@@ -576,16 +565,14 @@ class ImageSimilaritySearcher:
                     self.logger.error(f"OCR failed for {file_path}: {e}", exc_info=True)
                     self._increment_ocr_fail_count(img_id)
                     stats['failed'] += 1
-            
+
             return stats
-            
+
         except Exception as e:
             self.logger.error(f"Error during batch OCR processing: {e}", exc_info=True)
             return stats
         finally:
-            # 处理完成后立即清理OCR资源，释放内存
             self.cleanup_ocr_resources()
-            # 每批处理完成后显式触发垃圾回收
             gc.collect()
 
     def _get_ocr_text_by_id(self, img_id: int) -> Optional[str]:
@@ -607,19 +594,16 @@ class ImageSimilaritySearcher:
         with self._db_lock:
             cursor = self.conn.cursor()
             try:
-                # 先获取文件路径
                 cursor.execute("SELECT file_path FROM image_features WHERE id = ?", (img_id,))
                 result = cursor.fetchone()
                 file_path = result[0] if result else None
-                
-                # 更新数据库
+
                 cursor.execute(
                     "UPDATE image_features SET ocr_text = ?, ocr_status = ?, ocr_fail_count = ? WHERE id = ?",
                     (ocr_text, status, fail_count, img_id)
                 )
                 self.conn.commit()
-                
-                # 更新内存缓存
+
                 if file_path and status == 'completed':
                     self._update_ocr_cache(file_path, ocr_text)
                     
@@ -665,9 +649,8 @@ class ImageSimilaritySearcher:
         with self._db_lock:
             cursor = self.conn.cursor()
             try:
-                # 统计逻辑与 process_ocr_pending_images 保持一致
                 cursor.execute('''
-                    SELECT COUNT(*) FROM image_features 
+                    SELECT COUNT(*) FROM image_features
                     WHERE (ocr_status = 'pending' OR (ocr_status = 'failed' AND ocr_fail_count < ?))
                 ''', (max_retries,))
                 count = cursor.fetchone()[0]
@@ -1015,7 +998,6 @@ class ImageSimilaritySearcher:
 
     def _hamming_distance(self, hash1: str, hash2: str) -> int:
         """计算两个哈希字符串之间的汉明距离"""
-        # Ensure hashes are of the same length, phash is typically 64-bit (16 hex chars)
         if len(hash1) != len(hash2):
             self.logger.warning(f"Comparing hashes of different lengths: {hash1} ({len(hash1)}) vs {hash2} ({len(hash2)})")
             return 64
@@ -1031,12 +1013,11 @@ class ImageSimilaritySearcher:
         if not query_features:
             self.logger.warning(f"Could not extract features from query image: {query_image_path}")
             return []
-        
+
         with self._db_lock:
             cursor = self.conn.cursor()
-            
+
             try:
-                # 1. Check for exact file hash match first (most performant check)
                 cursor.execute('SELECT file_path, telegram_message_id, file_hash, updated_time, ocr_text FROM image_features WHERE file_hash = ?', (query_features['file_hash'],))
                 exact_match = cursor.fetchone()
                 if exact_match:
@@ -1050,7 +1031,8 @@ class ImageSimilaritySearcher:
                         'similarity': 1.0
                     }]
 
-                # 2. If no exact file hash match, search for similar phash matches
+                # The default threshold is intentionally loose enough for near-duplicates,
+                # while exact dedupe callers can force hash equality with threshold=0.
                 cursor.execute('SELECT file_path, phash, telegram_message_id, file_hash, updated_time, ocr_text FROM image_features WHERE phash IS NOT NULL')
                 results = []
                 for file_path, phash, msg_id, file_hash, updated_time, ocr_text in cursor.fetchall():
@@ -1089,20 +1071,16 @@ class ImageSimilaritySearcher:
                 - 'contains': 字符串包含搜索（内存遍历），最基础但最准确
         """
         try:
-            # 清理和规范化查询文本
             cleaned_keywords = keywords.strip()
             if not cleaned_keywords:
                 self.logger.warning(f"Query keywords empty after cleaning: '{keywords}'")
                 return []
-            
+
             if search_mode == 'comprehensive':
-                # 全面搜索模式：关键词 + 分词结果
                 return self._comprehensive_search(cleaned_keywords, max_results)
             elif search_mode == 'contains':
-                # 内存遍历搜索
                 return self._memory_contains_search(cleaned_keywords, max_results)
             else:
-                # 默认精确匹配模式
                 return self._exact_match_search(cleaned_keywords, max_results)
                     
         except Exception as e:
@@ -1117,10 +1095,8 @@ class ImageSimilaritySearcher:
         with self._db_lock:
             cursor = self.conn.cursor()
             try:
-                # 获取关键词的简繁体变体
                 variants = self._get_keyword_variants(keywords)
-                
-                # 构建LIKE查询
+
                 where_clauses = ["ocr_text LIKE ?" for _ in variants]
                 where_sql = ' OR '.join(where_clauses)
                 query_params = [f"%{variant}%" for variant in variants] + [max_results]
@@ -1204,21 +1180,17 @@ class ImageSimilaritySearcher:
         这是最基础但也最准确的搜索方式。
         """
         try:
-            # 获取关键词的简繁体变体（小写化以支持大小写不敏感搜索）
             variants = [v.lower() for v in self._get_keyword_variants(keywords)]
-            
+
             matched_paths = []
             with self._cache_lock:
                 for file_path, ocr_text in self._ocr_cache.items():
-                    # 小写化OCR文本进行比较
                     ocr_lower = ocr_text.lower()
-                    # 检查是否包含任一变体
                     if any(variant in ocr_lower for variant in variants):
                         matched_paths.append(file_path)
-                        if len(matched_paths) >= max_results * 10:  # 预先获取更多以便后续排序
+                        if len(matched_paths) >= max_results * 10:
                             break
-            
-            # 从数据库获取完整信息
+
             if not matched_paths:
                 self.logger.info(f"Memory contains search for '{keywords}' found 0 results")
                 return []
@@ -1359,36 +1331,28 @@ class ImageSimilaritySearcher:
 
     def cleanup_ocr_resources(self):
         """清理OCR引擎占用的内存资源"""
-        # 如果使用 Mac 快捷指令，不需要清理 PaddleOCR 资源
         if self._use_mac_shortcuts():
             return
-        
+
         try:
             if hasattr(self, 'ocr_engine') and self.ocr_engine is not None:
-                # 尝试清理PaddleOCR的内部资源
                 if hasattr(self.ocr_engine, 'text_detector'):
                     del self.ocr_engine.text_detector
                 if hasattr(self.ocr_engine, 'text_recognizer'):
                     del self.ocr_engine.text_recognizer
                 if hasattr(self.ocr_engine, 'text_classifier'):
                     del self.ocr_engine.text_classifier
-                
-                # 清理主引擎对象
+
                 del self.ocr_engine
                 self.ocr_engine = None
-                
-                # 触发垃圾回收
                 gc.collect()
                 self.logger.info("OCR resources cleaned up successfully")
         except Exception as e:
             self.logger.warning(f"Failed to cleanup OCR resources: {e}")
     
     def reinitialize_ocr(self):
-        """重新初始化OCR引擎（在清理后使用）- 懒加载模式下不需要主动调用"""
-        # 懒加载模式下，OCR引擎会在下次需要时自动加载
-        # 这个方法保留是为了兼容性，实际上什么都不做
+        """兼容性保留方法；懒加载模式下无需主动重建 OCR 引擎。"""
         self.logger.info("OCR engine will be lazy-loaded when needed")
-        pass
 
     def close(self):
         """关闭数据库连接并清理资源"""
