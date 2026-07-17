@@ -528,43 +528,9 @@ class ImageSimilaritySearcher:
                 self._ensure_ocr_engine()
 
             for img_id, file_path in pending_images:
-                if not os.path.exists(file_path):
-                    self.logger.warning(f"Image file not found: {file_path}. Marking as skipped.")
-                    self._mark_ocr_skipped(img_id)
-                    stats['skipped'] += 1
-                    continue
-
-                stats['processed'] += 1
-                try:
-                    file_size = os.path.getsize(file_path)
-                    if file_size == 0:
-                        self.logger.warning(f"Image file is empty: {file_path}. Marking as skipped.")
-                        self._mark_ocr_skipped(img_id)
-                        stats['skipped'] += 1
-                        continue
-
-                    # 已有人工修正或历史有效 OCR 时，避免空结果覆盖已有文本。
-                    db_ocr_text = self._get_ocr_text_by_id(img_id)
-                    self.logger.debug(f"Processing OCR for {file_path} (id: {img_id})...")
-                    ocr_text = self._extract_text_from_image(file_path)
-
-                    if ocr_text and not db_ocr_text:
-                        self._update_ocr_result(img_id, ocr_text, 'completed', 0)
-                        stats['succeeded'] += 1
-                        self.logger.info(f"Successfully processed OCR for {file_path}")
-                    elif db_ocr_text:
-                        # Empty reruns should not overwrite previously usable OCR text.
-                        self._update_ocr_result(img_id, db_ocr_text, 'completed', 0)
-                        stats['skipped'] += 1
-                        self.logger.info(f"Skipped OCR for {file_path}: keeping existing text ({len(db_ocr_text)} chars)")
-                    else:
-                        self._increment_ocr_fail_count(img_id)
-                        stats['failed'] += 1
-                        self.logger.warning(f"OCR result empty for {file_path}, marked as failed")
-                except Exception as e:
-                    self.logger.error(f"OCR failed for {file_path}: {e}", exc_info=True)
-                    self._increment_ocr_fail_count(img_id)
-                    stats['failed'] += 1
+                image_stats = self._process_ocr_record_once(img_id, file_path)
+                for key in stats:
+                    stats[key] += image_stats[key]
 
             return stats
 
@@ -574,6 +540,99 @@ class ImageSimilaritySearcher:
         finally:
             self.cleanup_ocr_resources()
             gc.collect()
+
+    def process_ocr_image_by_hash(self, file_hash: str) -> Dict[str, int]:
+        """
+        对指定文件哈希对应的图片执行一次 OCR。
+        仅处理 pending 或 failed 状态；completed/success 状态不会重复 OCR。
+        """
+        stats = {'processed': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0, 'not_found': 0, 'already_completed': 0, 'not_retryable': 0}
+        if not file_hash:
+            stats['not_found'] = 1
+            return stats
+
+        try:
+            with self._db_lock:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT id, file_path, ocr_status FROM image_features WHERE file_hash = ?",
+                    (file_hash,)
+                )
+                result = cursor.fetchone()
+                cursor.close()
+
+            if not result:
+                self.logger.warning(f"No image found with file_hash for single OCR: {file_hash}")
+                stats['not_found'] = 1
+                return stats
+
+            img_id, file_path, ocr_status = result
+            if ocr_status in ('completed', 'success'):
+                stats['already_completed'] = 1
+                return stats
+            if ocr_status not in ('pending', 'failed'):
+                stats['not_retryable'] = 1
+                return stats
+
+            self.logger.info(f"Processing single OCR for {file_path} (status: {ocr_status})...")
+            if not self._use_mac_shortcuts():
+                self._ensure_ocr_engine()
+
+            image_stats = self._process_ocr_record_once(img_id, file_path)
+            for key in ('processed', 'succeeded', 'failed', 'skipped'):
+                stats[key] += image_stats[key]
+            return stats
+        except Exception as e:
+            self.logger.error(f"Error during single image OCR processing for hash {file_hash}: {e}", exc_info=True)
+            stats['failed'] += 1
+            return stats
+        finally:
+            self.cleanup_ocr_resources()
+            gc.collect()
+
+    def _process_ocr_record_once(self, img_id: int, file_path: str) -> Dict[str, int]:
+        """对单条数据库记录执行一次 OCR，并返回处理统计。"""
+        stats = {'processed': 0, 'succeeded': 0, 'failed': 0, 'skipped': 0}
+
+        if not os.path.exists(file_path):
+            self.logger.warning(f"Image file not found: {file_path}. Marking as skipped.")
+            self._mark_ocr_skipped(img_id)
+            stats['skipped'] += 1
+            return stats
+
+        stats['processed'] += 1
+        try:
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                self.logger.warning(f"Image file is empty: {file_path}. Marking as skipped.")
+                self._mark_ocr_skipped(img_id)
+                stats['skipped'] += 1
+                return stats
+
+            # 已有人工修正或历史有效 OCR 时，避免空结果覆盖已有文本。
+            db_ocr_text = self._get_ocr_text_by_id(img_id)
+            self.logger.debug(f"Processing OCR for {file_path} (id: {img_id})...")
+            ocr_text = self._extract_text_from_image(file_path)
+
+            if ocr_text and not db_ocr_text:
+                self._update_ocr_result(img_id, ocr_text, 'completed', 0)
+                stats['succeeded'] += 1
+                self.logger.info(f"Successfully processed OCR for {file_path}")
+            elif db_ocr_text:
+                # Empty reruns should not overwrite previously usable OCR text.
+                self._update_ocr_result(img_id, db_ocr_text, 'completed', 0)
+                stats['skipped'] += 1
+                self.logger.info(f"Skipped OCR for {file_path}: keeping existing text ({len(db_ocr_text)} chars)")
+            else:
+                self._increment_ocr_fail_count(img_id)
+                stats['failed'] += 1
+                self.logger.warning(f"OCR result empty for {file_path}, marked as failed")
+        except Exception as e:
+            self.logger.error(f"OCR failed for {file_path}: {e}", exc_info=True)
+            self._increment_ocr_fail_count(img_id)
+            stats['failed'] += 1
+
+        return stats
 
     def _get_ocr_text_by_id(self, img_id: int) -> Optional[str]:
         """通过 ID 获取图片的 OCR 文本"""

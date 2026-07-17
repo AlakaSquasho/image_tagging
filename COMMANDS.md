@@ -8,6 +8,7 @@
 - `reply to an image with /find`: search by image
 - `/r [count]`: send random images
 - `/ocr`: process pending OCR images
+- `reply to an image with /ocr`: run OCR once for that image if it is pending or failed
 - `reply to an image with /tag <text>`: set OCR text manually
 - `reply to an image with /untag`: clear OCR text and reset it to pending
 - `reply to an image with /link <message id or link>`: attach a message ID to an image without one
@@ -57,9 +58,11 @@ Image search:
 
 ```text
 /ocr
+[reply to an image] /ocr
 ```
 
-- Processes all pending OCR images and retryable failed images
+- Without a reply: processes all pending OCR images and retryable failed images
+- With an image reply: runs OCR once only for that image when its status is pending or failed; completed images are skipped
 
 ## `/tag`
 

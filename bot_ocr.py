@@ -1,10 +1,12 @@
 import asyncio
+import os
 from datetime import datetime
+from uuid import uuid4
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config import ALLOWED_USER_ID, OCR_BATCH_SIZE, OCR_MAX_RETRIES
+from config import ALLOWED_USER_ID, IMAGE_DOWNLOAD_PATH, OCR_BATCH_SIZE, OCR_MAX_RETRIES
 from i18n import t
 
 from bot_common import BotDeps, get_effective_language, get_user_language
@@ -13,7 +15,9 @@ from bot_ui import create_progress_bar
 
 async def ocr_command(deps: BotDeps, update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    处理 /ocr 命令，立即对所有未 OCR 的图片进行处理。
+    处理 /ocr 命令：
+    - 普通使用时立即对所有未 OCR 的图片进行处理。
+    - 回复图片使用时，仅对该图片执行一次 OCR（仅限 pending/failed 状态）。
     bot 侧负责进度展示与消息更新，OCR 实际执行仍由 searcher 承担。
     """
     import gc
@@ -25,6 +29,11 @@ async def ocr_command(deps: BotDeps, update: Update, context: ContextTypes.DEFAU
         return
 
     language = get_effective_language(deps, update, context)
+
+    if update.message.reply_to_message:
+        await ocr_replied_image(deps, update, context, language)
+        return
+
     pending_count = deps.searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
     if pending_count == 0:
         await update.message.reply_text(t(language, "ocr.none_pending"))
@@ -134,6 +143,85 @@ async def ocr_command(deps: BotDeps, update: Update, context: ContextTypes.DEFAU
             )
         except Exception:
             await update.message.reply_text(error_message)
+
+
+async def ocr_replied_image(deps: BotDeps, update: Update, context: ContextTypes.DEFAULT_TYPE, language: str):
+    """回复图片使用 /ocr 时，只处理被回复的这一张已索引图片。"""
+    replied_message = update.message.reply_to_message
+    if not replied_message.photo:
+        await update.message.reply_text(t(language, "ocr.reply_photo_required"), reply_to_message_id=update.message.message_id)
+        return
+
+    photo = replied_message.photo[-1]
+    file_ext = os.path.splitext(photo.file_unique_id)[1] or '.jpg'
+    temp_file_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"temp_ocr_{uuid4()}{file_ext}")
+    status_message = None
+
+    try:
+        if not os.path.exists(IMAGE_DOWNLOAD_PATH):
+            os.makedirs(IMAGE_DOWNLOAD_PATH, exist_ok=True)
+
+        file = await context.bot.get_file(photo.file_id)
+        await file.download_to_drive(temp_file_path)
+        if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) == 0:
+            deps.logger.error(f"Downloaded file is empty or doesn't exist: {temp_file_path}")
+            await update.message.reply_text(t(language, "ocr.download_failed"), reply_to_message_id=update.message.message_id)
+            return
+
+        similar_results = deps.searcher.search_similar_images(temp_file_path, threshold=0, max_results=1)
+        if not similar_results or similar_results[0].get('similarity') != 1.0:
+            await update.message.reply_text(t(language, "ocr.record_not_found"), reply_to_message_id=update.message.message_id)
+            return
+
+        image_record = similar_results[0]
+        file_hash = image_record.get('file_hash')
+        status_message = await update.message.reply_text(
+            t(language, "ocr.single_start"),
+            reply_to_message_id=update.message.message_id,
+        )
+
+        loop = asyncio.get_running_loop()
+        stats = await loop.run_in_executor(None, lambda: deps.searcher.process_ocr_image_by_hash(file_hash))
+
+        if stats.get('already_completed'):
+            message = t(language, "ocr.single_already_completed")
+        elif stats.get('not_retryable'):
+            message = t(language, "ocr.single_not_retryable")
+        elif stats.get('succeeded'):
+            message = t(language, "ocr.single_done")
+        elif stats.get('skipped'):
+            message = t(language, "ocr.single_skipped")
+        elif stats.get('failed'):
+            message = t(language, "ocr.single_failed", max_retries=OCR_MAX_RETRIES)
+        else:
+            message = t(language, "ocr.single_noop")
+
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_message.message_id,
+            text=message,
+        )
+    except Exception as e:
+        deps.logger.error(f"Error during reply OCR: {e}", exc_info=True)
+        error_message = t(language, "ocr.error", error=str(e))
+        if status_message:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=status_message.message_id,
+                    text=error_message,
+                )
+            except Exception:
+                await update.message.reply_text(error_message, reply_to_message_id=update.message.message_id)
+        else:
+            await update.message.reply_text(error_message, reply_to_message_id=update.message.message_id)
+    finally:
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                deps.logger.info(f"Cleaned up temporary file: {temp_file_path}")
+            except OSError as e:
+                deps.logger.error(f"Failed to clean up temporary file {temp_file_path}: {e}")
 
 
 async def scheduled_ocr_task(deps: BotDeps, context: ContextTypes.DEFAULT_TYPE):
