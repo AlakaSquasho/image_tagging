@@ -3,7 +3,7 @@ import shutil
 import asyncio
 from datetime import datetime
 from uuid import uuid4
-from typing import Any, List
+from typing import Any, List, Optional
 
 from telegram import InputFile, MessageOriginChannel, Update
 from telegram.ext import ContextTypes
@@ -31,6 +31,22 @@ def get_image_files_in_folder(deps: BotDeps, folder_path: str) -> List[str]:
         deps.logger.error(f"Unexpected error in get_image_files_in_folder: {e}")
 
     return files
+
+
+async def _update_status_message(deps: BotDeps, status_message: Any, update: Update, language: str, key: str, parse_mode: Optional[str] = None, **kwargs) -> None:
+    """把“处理中”占位消息编辑为最终结果；占位消息不存在或编辑失败时回退为直接回复。"""
+    text = t(language, key, **kwargs)
+    if status_message is not None:
+        try:
+            await status_message.edit_text(text, parse_mode=parse_mode)
+            return
+        except Exception as e:
+            deps.logger.warning(f"Failed to edit status message, falling back to reply: {e}")
+    await update.message.reply_text(
+        text,
+        reply_to_message_id=update.message.message_id,
+        parse_mode=parse_mode,
+    )
 
 
 async def check_and_archive_images(deps: BotDeps, download_folder: str, max_count: int, searcher_instance: Any, context: ContextTypes.DEFAULT_TYPE):
@@ -129,7 +145,7 @@ async def check_and_archive_images(deps: BotDeps, download_folder: str, max_coun
         deps.logger.info(f"Image count ({len(image_files)}) is below {max_count}. No archive needed.")
 
 
-async def handle_photo_with_retry(deps: BotDeps, update: Update, context: ContextTypes.DEFAULT_TYPE, max_retries: int = OCR_MAX_RETRIES) -> bool:
+async def handle_photo_with_retry(deps: BotDeps, update: Update, context: ContextTypes.DEFAULT_TYPE, max_retries: int = OCR_MAX_RETRIES, status_message: Optional[Any] = None) -> bool:
     """
     处理用户发图入口，带有限次重试。
     该流程同时负责：按图搜索快捷入口、重复图检测、入库和归档触发。
@@ -178,12 +194,14 @@ async def handle_photo_with_retry(deps: BotDeps, update: Update, context: Contex
 
                 if existing_telegram_message_id_in_db:
                     deps.logger.info(f"Duplicate image received, original telegram_message_id: {existing_telegram_message_id_in_db}")
-                    await update.message.reply_text(
-                        t(language, "photo.duplicate_with_id", message_id=existing_telegram_message_id_in_db),
-                        reply_to_message_id=current_message_id,
+                    await _update_status_message(
+                        deps, status_message, update, language,
+                        "photo.duplicate_with_id",
+                        message_id=existing_telegram_message_id_in_db,
                     )
                 else:
                     try:
+                        await _update_status_message(deps, status_message, update, language, "photo.duplicate_found")
                         with open(exact_match_data['path'], 'rb') as photo_file:
                             caption = t(
                                 language,
@@ -201,16 +219,10 @@ async def handle_photo_with_retry(deps: BotDeps, update: Update, context: Contex
                             )
                             deps.logger.info(f"Duplicate image received with no source message ID, sent details for {exact_match_data['path']}")
                     except FileNotFoundError:
-                        await update.message.reply_text(
-                            t(language, "photo.duplicate_missing_source"),
-                            reply_to_message_id=current_message_id,
-                        )
+                        await _update_status_message(deps, status_message, update, language, "photo.duplicate_missing_source")
                     except Exception as e:
                         deps.logger.error(f"Error sending existing image details: {e}")
-                        await update.message.reply_text(
-                            t(language, "photo.duplicate_process_error"),
-                            reply_to_message_id=current_message_id,
-                        )
+                        await _update_status_message(deps, status_message, update, language, "photo.duplicate_process_error")
             else:
                 permanent_path = os.path.join(IMAGE_DOWNLOAD_PATH, f"{current_message_id}_{photo.file_unique_id}{file_ext}")
                 os.rename(temp_save_path, permanent_path)
@@ -222,10 +234,11 @@ async def handle_photo_with_retry(deps: BotDeps, update: Update, context: Contex
 
                 deps.logger.info(f"Indexed new image at {permanent_path}")
                 pending_count = deps.searcher.get_pending_ocr_count(OCR_MAX_RETRIES)
-                await update.message.reply_text(
-                    t(language, "photo.index_success", pending_count=pending_count),
-                    reply_to_message_id=current_message_id,
+                await _update_status_message(
+                    deps, status_message, update, language,
+                    "photo.index_success",
                     parse_mode='Markdown',
+                    pending_count=pending_count,
                 )
                 await check_and_archive_images(deps, IMAGE_DOWNLOAD_PATH, MAX_IMAGES_IN_DOWNLOAD_FOLDER, deps.searcher, context)
 
@@ -242,10 +255,7 @@ async def handle_photo_with_retry(deps: BotDeps, update: Update, context: Contex
                 await asyncio.sleep(1)
                 continue
 
-            await update.message.reply_text(
-                t(language, "photo.retry_failed", max_retries=max_retries),
-                reply_to_message_id=current_message_id,
-            )
+            await _update_status_message(deps, status_message, update, language, "photo.retry_failed", max_retries=max_retries)
             deps.logger.error(f"Failed to handle photo after {max_retries + 1} attempts with message_id {current_message_id}")
             return False
         finally:
@@ -260,19 +270,27 @@ async def handle_photo_with_retry(deps: BotDeps, update: Update, context: Contex
 
 async def handle_photo(deps: BotDeps, update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理普通发图入口。"""
+    status_message = None
     try:
         deps.logger.info(f"📸 Received photo from user {update.message.from_user.id}, message_id: {update.message.message_id}")
         if update.message.from_user.id != ALLOWED_USER_ID:
             deps.logger.warning(f"❌ Unauthorized user {update.message.from_user.id} tried to interact.")
             return
 
-        await update.message.reply_text(translate(deps, context, update, "common.processing"))
-        await handle_photo_with_retry(deps, update, context)
+        # 带 /find caption 的图片直接走按图搜索，由搜索流程自行返回结果，不发“处理中”。
+        if update.message.caption and update.message.caption.strip().lower() == '/find':
+            await handle_photo_with_retry(deps, update, context, status_message=None)
+        else:
+            status_message = await update.message.reply_text(translate(deps, context, update, "common.processing"))
+            await handle_photo_with_retry(deps, update, context, status_message=status_message)
         deps.logger.info(f"✅ Photo processing completed for message_id: {update.message.message_id}")
     except Exception as e:
         deps.logger.error(f"❌ Critical error in handle_photo: {e}", exc_info=True)
         try:
-            await update.message.reply_text(translate(deps, context, update, "photo.critical_error", error=str(e)))
+            if status_message is not None:
+                await status_message.edit_text(translate(deps, context, update, "photo.critical_error", error=str(e)))
+            else:
+                await update.message.reply_text(translate(deps, context, update, "photo.critical_error", error=str(e)))
         except Exception:
             pass
 
