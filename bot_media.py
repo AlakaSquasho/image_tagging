@@ -44,7 +44,7 @@ async def _update_status_message(deps: BotDeps, status_message: Any, update: Upd
             deps.logger.warning(f"Failed to edit status message, falling back to reply: {e}")
     await update.message.reply_text(
         text,
-        reply_to_message_id=update.message.message_id,
+        do_quote=True,
         parse_mode=parse_mode,
     )
 
@@ -281,7 +281,7 @@ async def handle_photo(deps: BotDeps, update: Update, context: ContextTypes.DEFA
         if update.message.caption and update.message.caption.strip().lower() == '/find':
             await handle_photo_with_retry(deps, update, context, status_message=None)
         else:
-            status_message = await update.message.reply_text(translate(deps, context, update, "common.processing"))
+            status_message = await update.message.reply_text(translate(deps, context, update, "common.processing"), do_quote=True)
             await handle_photo_with_retry(deps, update, context, status_message=status_message)
         deps.logger.info(f"✅ Photo processing completed for message_id: {update.message.message_id}")
     except Exception as e:
@@ -290,7 +290,7 @@ async def handle_photo(deps: BotDeps, update: Update, context: ContextTypes.DEFA
             if status_message is not None:
                 await status_message.edit_text(translate(deps, context, update, "photo.critical_error", error=str(e)))
             else:
-                await update.message.reply_text(translate(deps, context, update, "photo.critical_error", error=str(e)))
+                await update.message.reply_text(translate(deps, context, update, "photo.critical_error", error=str(e)), do_quote=True)
         except Exception:
             pass
 
