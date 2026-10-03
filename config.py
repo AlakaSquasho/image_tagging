@@ -36,6 +36,10 @@ FIND_PAGINATION_ENABLED = True
 FIND_PAGE_SIZE = 9  # 运行时会限制在 1-9
 RANDOM_DEFAULT_COUNT = 9
 
+# 搜索结果合并配置
+FIND_MERGE_PAGE_ENABLED = False  # 开启后每页图片合并为单张网格图（9 张即九宫格），翻页只需删 1 条消息
+FIND_MERGE_CELL_SIZE = 512  # 合并图每个单元格的目标边长（像素），运行时会限制在 64-1024
+
 # 语言配置
 DEFAULT_LANGUAGE = "zh"
 SUPPORTED_LANGUAGES = ("zh", "en")

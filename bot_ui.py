@@ -1,13 +1,24 @@
+import asyncio
 import os
 from typing import Dict, List, Optional, Tuple
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, Update
 from telegram.ext import ContextTypes
 
-from config import DEFAULT_LANGUAGE, FIND_PAGE_SIZE, RANDOM_DEFAULT_COUNT
+from config import DEFAULT_LANGUAGE, FIND_MERGE_CELL_SIZE, FIND_MERGE_PAGE_ENABLED, FIND_PAGE_SIZE, RANDOM_DEFAULT_COUNT
 from i18n import t
 
 from bot_common import BotDeps, get_effective_language, translate
+from image_collage import build_collage_image
+
+CAPTION_MAX_LENGTH = 1024
+
+
+def clamp_caption(text: str, limit: int = CAPTION_MAX_LENGTH) -> str:
+    """把说明文字限制在 Telegram caption 长度上限内。"""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def create_progress_bar(current: int, total: int, bar_length: int = 20) -> str:
@@ -92,6 +103,58 @@ def build_find_summary_text(state: Dict, page: int, total_pages: int, page_resul
     return summary_text
 
 
+async def send_merged_page_photo(
+    deps: BotDeps,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    page_results: List[Dict],
+    summary_text: str,
+    keyboard: Optional[InlineKeyboardMarkup],
+    reply_to_message_id: Optional[int],
+) -> Optional[int]:
+    """
+    合并模式下把一页结果作为单张照片发送（多张拼图，单张直接发原图）。
+    摘要与翻页按钮作为说明文字挂在同一条消息上；失败时返回 None 以便回退到原媒体组路径。
+    """
+    page_paths = [result["path"] for result in page_results if os.path.exists(result["path"])]
+    if not page_paths:
+        return None
+
+    photo_bytes = None
+    if len(page_paths) == 1:
+        try:
+            with open(page_paths[0], "rb") as photo_file:
+                photo_bytes = photo_file.read()
+        except OSError as e:
+            deps.logger.error(f"Failed to read search result image {page_paths[0]}: {e}")
+    else:
+        try:
+            photo_bytes = await asyncio.to_thread(
+                build_collage_image,
+                page_paths,
+                cell_size=FIND_MERGE_CELL_SIZE,
+                logger=deps.logger,
+            )
+        except Exception as e:
+            deps.logger.error(f"Failed to build collage: {e}", exc_info=True)
+
+    if not photo_bytes:
+        return None
+
+    try:
+        message = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=InputFile(photo_bytes, filename="find_page.jpg"),
+            caption=clamp_caption(summary_text),
+            reply_markup=keyboard,
+            reply_to_message_id=reply_to_message_id,
+        )
+        return message.message_id
+    except Exception as e:
+        deps.logger.error(f"Failed to send merged result image: {e}")
+        return None
+
+
 async def render_find_page(
     deps: BotDeps,
     update: Update,
@@ -136,35 +199,52 @@ async def render_find_page(
                 continue
         message_ids = []
 
-    media_group = []
-    for result in page_results:
-        if not os.path.exists(result["path"]):
-            deps.logger.warning(f"Search result file not found: {result['path']}")
-            continue
-        try:
-            with open(result["path"], "rb") as photo_file:
-                media_group.append(InputMediaPhoto(media=photo_file.read()))
-        except Exception as e:
-            deps.logger.error(f"Failed to prepare search result image: {e}")
-
-    if media_group:
-        try:
-            media_messages = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-            message_ids.extend([m.message_id for m in media_messages])
-        except Exception as e:
-            deps.logger.error(f"Failed to send media group: {e}")
-
-    if summary_message_id:
-        message_ids.append(summary_message_id)
-    else:
-        summary_message = await context.bot.send_message(
-            chat_id=chat_id,
-            text=summary_text,
-            reply_markup=keyboard,
-            reply_to_message_id=update.message.message_id if update.message else None,
+    merged_sent = False
+    if FIND_MERGE_PAGE_ENABLED:
+        merged_message_id = await send_merged_page_photo(
+            deps,
+            context,
+            chat_id,
+            page_results,
+            summary_text,
+            keyboard,
+            update.message.message_id if update.message else None,
         )
-        summary_message_id = summary_message.message_id
-        message_ids.append(summary_message_id)
+        if merged_message_id:
+            message_ids.append(merged_message_id)
+            state["summary_message_id"] = None
+            merged_sent = True
+
+    if not merged_sent:
+        media_group = []
+        for result in page_results:
+            if not os.path.exists(result["path"]):
+                deps.logger.warning(f"Search result file not found: {result['path']}")
+                continue
+            try:
+                with open(result["path"], "rb") as photo_file:
+                    media_group.append(InputMediaPhoto(media=photo_file.read()))
+            except Exception as e:
+                deps.logger.error(f"Failed to prepare search result image: {e}")
+
+        if media_group:
+            try:
+                media_messages = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+                message_ids.extend([m.message_id for m in media_messages])
+            except Exception as e:
+                deps.logger.error(f"Failed to send media group: {e}")
+
+        if summary_message_id:
+            message_ids.append(summary_message_id)
+        else:
+            summary_message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=summary_text,
+                reply_markup=keyboard,
+                reply_to_message_id=update.message.message_id if update.message else None,
+            )
+            summary_message_id = summary_message.message_id
+            message_ids.append(summary_message_id)
 
     state["message_ids"] = message_ids
     state["current_page"] = page

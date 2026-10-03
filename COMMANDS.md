@@ -38,6 +38,7 @@ Notes:
 - `--comprehensive` / `--com`: full keyword + tokenized search
 - `--contains`: search OCR text by substring match
 - `-5`, `-n=5`, `--max=10`: limit the number of results
+- When result merging is on (`FIND_MERGE_PAGE_ENABLED = True`), each page is sent as a single grid image with the summary and paging buttons in its caption
 
 Image search:
 
@@ -54,6 +55,7 @@ Image search:
 
 - Uses the default count from `config.py` when no count is provided
 - Results may be paginated when there are too many images
+- When result merging is on (`FIND_MERGE_PAGE_ENABLED = True`), each page is sent as a single grid image so paging only deletes one message
 
 ## `/ocr`
 
