@@ -33,6 +33,17 @@ def get_image_files_in_folder(deps: BotDeps, folder_path: str) -> List[str]:
     return files
 
 
+def count_archive_folders(folder_path: str) -> int:
+    """统计下载目录下的归档子文件夹数量。"""
+    try:
+        return sum(
+            1 for item in os.listdir(folder_path)
+            if os.path.isdir(os.path.join(folder_path, item))
+        )
+    except OSError:
+        return 0
+
+
 async def _update_status_message(deps: BotDeps, status_message: Any, update: Update, language: str, key: str, parse_mode: Optional[str] = None, **kwargs) -> None:
     """把“处理中”占位消息编辑为最终结果；占位消息不存在或编辑失败时回退为直接回复。"""
     text = t(language, key, **kwargs)

@@ -65,6 +65,7 @@ docker-compose down
 - `回复图片 /link 消息ID或链接`：补充消息 ID
 - `/getocr`：查看图片 OCR 文本
 - `/failed`：查看 OCR 失败记录
+- `/status` 或 `/s`：查看索引、OCR 队列与存储的分类统计
 - `/help`：以 Markdown 形式输出当前语言对应的命令说明
 - `/language <zh|en>` 或 `/lang <zh|en>`：在中文和英文之间切换 bot 输出语言
 

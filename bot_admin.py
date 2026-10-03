@@ -12,12 +12,16 @@ from config import (
     DEFAULT_LANGUAGE,
     FAILED_OCR_DEFAULT_LIMIT,
     IMAGE_DOWNLOAD_PATH,
+    MAX_IMAGES_IN_DOWNLOAD_FOLDER,
+    OCR_BATCH_SIZE,
     OCR_MAX_RETRIES,
+    OCR_SCHEDULED_TIME,
     SUPPORTED_LANGUAGES,
 )
 from i18n import get_language_name, is_supported_language, normalize_language, t
 
 from bot_common import BotDeps, get_effective_language
+from bot_media import count_archive_folders, get_image_files_in_folder
 
 
 def get_help_document_path(language: str) -> str:
@@ -402,6 +406,40 @@ async def failed_command(deps: BotDeps, update: Update, context: ContextTypes.DE
         complete_msg += t(language, "failed.complete_more", total=failed_count)
 
     await context.bot.send_message(chat_id=update.effective_chat.id, text=complete_msg)
+
+
+async def status_command(deps: BotDeps, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 /status（别名 /s），展示索引、OCR 队列与存储的分类统计。"""
+    deps.logger.info(f"📊 Received /status command from user {update.message.from_user.id}")
+    if update.message.from_user.id != ALLOWED_USER_ID:
+        deps.logger.warning(f"❌ Unauthorized user {update.message.from_user.id} tried to interact with /status.")
+        return
+
+    language = get_effective_language(deps, update, context)
+    try:
+        stats = deps.searcher.get_statistics(OCR_MAX_RETRIES)
+        text = t(
+            language,
+            "status.panel",
+            total=stats['total'],
+            completed=stats['completed'],
+            queue=stats['queue'],
+            pending=stats['pending'],
+            retryable_failed=stats['retryable_failed'],
+            failed=stats['failed'],
+            exhausted_failed=stats['exhausted_failed'],
+            skipped=stats['skipped'],
+            download_count=len(get_image_files_in_folder(deps, IMAGE_DOWNLOAD_PATH)),
+            max_download=MAX_IMAGES_IN_DOWNLOAD_FOLDER,
+            archive_count=count_archive_folders(IMAGE_DOWNLOAD_PATH),
+            scheduled_time=OCR_SCHEDULED_TIME,
+            batch_size=OCR_BATCH_SIZE,
+            max_retries=OCR_MAX_RETRIES,
+        )
+        await update.message.reply_text(text, reply_to_message_id=update.message.message_id)
+    except Exception as e:
+        deps.logger.error(f"Error in status_command: {e}", exc_info=True)
+        await update.message.reply_text(t(language, "status.error"), reply_to_message_id=update.message.message_id)
 
 
 async def language_command(deps: BotDeps, update: Update, context: ContextTypes.DEFAULT_TYPE):

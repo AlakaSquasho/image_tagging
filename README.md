@@ -67,6 +67,7 @@ docker-compose down
 - `reply to an image with /link <message id or link>`: attach a message ID
 - `/getocr`: view OCR text for an image
 - `/failed`: view failed OCR records
+- `/status` or `/s`: show index, OCR queue, and storage statistics
 - `/help`: output the localized command reference in Markdown
 - `/language <zh|en>` or `/lang <zh|en>`: switch the bot output language between Chinese and English
 

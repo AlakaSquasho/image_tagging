@@ -730,6 +730,52 @@ class ImageSimilaritySearcher:
                 self.logger.error(f"Failed to get failed OCR count: {e}")
                 return 0
 
+    def get_statistics(self, max_retries: int = 3) -> Dict[str, int]:
+        """
+        汇总索引与 OCR 状态的分类计数，供 /status 展示。
+
+        queue 与 get_pending_ocr_count 的定义保持一致（pending + 可重试 failed）。
+        """
+        empty_stats = {
+            'total': 0,
+            'completed': 0,
+            'pending': 0,
+            'queue': 0,
+            'failed': 0,
+            'retryable_failed': 0,
+            'exhausted_failed': 0,
+            'skipped': 0,
+        }
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    SELECT
+                        COUNT(*),
+                        SUM(CASE WHEN ocr_status = 'completed' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN ocr_status = 'pending' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN ocr_status = 'pending' OR (ocr_status = 'failed' AND ocr_fail_count < ?) THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN ocr_status = 'failed' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN ocr_status = 'failed' AND ocr_fail_count < ? THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN ocr_status = 'skipped' THEN 1 ELSE 0 END)
+                    FROM image_features
+                ''', (max_retries, max_retries))
+                row = cursor.fetchone()
+                total, completed, pending, queue, failed, retryable_failed, skipped = [value or 0 for value in row]
+                return {
+                    'total': total,
+                    'completed': completed,
+                    'pending': pending,
+                    'queue': queue,
+                    'failed': failed,
+                    'retryable_failed': retryable_failed,
+                    'exhausted_failed': failed - retryable_failed,
+                    'skipped': skipped,
+                }
+            except Exception as e:
+                self.logger.error(f"Failed to get statistics: {e}")
+                return empty_stats
+
     def get_random_images(self, limit: int) -> List[Dict]:
         """
         随机获取已索引图片记录。

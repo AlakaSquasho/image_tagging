@@ -9,7 +9,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
-from bot_admin import failed_command, getocr_command, help_command, language_command, setmessageid_command, tag_command, untag_command
+from bot_admin import failed_command, getocr_command, help_command, language_command, setmessageid_command, status_command, tag_command, untag_command
 from bot_common import BotDeps
 from bot_media import handle_photo
 from bot_ocr import ocr_command, scheduled_ocr_task
@@ -109,6 +109,8 @@ def create_application():
     app.add_handler(CommandHandler('link', bind_handler(setmessageid_command, deps)))
     app.add_handler(CommandHandler('getocr', bind_handler(getocr_command, deps)))
     app.add_handler(CommandHandler('failed', bind_handler(failed_command, deps)))
+    app.add_handler(CommandHandler('status', bind_handler(status_command, deps)))
+    app.add_handler(CommandHandler('s', bind_handler(status_command, deps)))
     app.add_handler(CommandHandler('help', bind_handler(help_command, deps)))
     app.add_handler(CommandHandler('language', bind_handler(language_command, deps)))
     app.add_handler(CommandHandler('lang', bind_handler(language_command, deps)))

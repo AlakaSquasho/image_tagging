@@ -14,6 +14,7 @@
 - `reply to an image with /link <message id or link>`: attach a message ID to an image without one
 - `reply to an image with /getocr`: view the current OCR text of an image
 - `/failed`: view failed OCR records
+- `/status` or `/s`: show index, OCR queue, and storage statistics
 - `/help`: output the localized command reference in Markdown (`COMMANDS_zh.md` for Chinese, otherwise `COMMANDS.md`)
 - `/language <zh|en>` or `/lang <zh|en>`: switch the bot output language between Chinese and English
 
@@ -108,6 +109,19 @@ Image search:
 
 - Shows failed OCR records
 - `-a` / `-all` shows all records
+
+## `/status` and `/s`
+
+```text
+/status
+/s
+```
+
+- Shows a summary panel of indexed images and OCR task state
+- Daily task queue = pending images plus failed images that can still be retried (`ocr_fail_count < OCR_MAX_RETRIES`)
+- Failed records are split into retryable and exhausted (retry limit reached, no longer retried)
+- Also reports the download folder image count against `MAX_IMAGES_IN_DOWNLOAD_FOLDER`, the archive folder count, and the scheduled task settings
+- `/s` is a short alias for `/status`
 
 ## `/help`
 

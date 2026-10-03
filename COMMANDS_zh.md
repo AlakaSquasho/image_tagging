@@ -12,6 +12,7 @@
 - `回复图片 /link <消息ID或链接>`：为没有消息 ID 的图片补充消息 ID
 - `回复图片 /getocr`：查看图片当前 OCR 文本
 - `/failed`：查看 OCR 失败记录
+- `/status` 或 `/s`：查看索引、OCR 队列与存储的分类统计
 - `/help`：以 Markdown 形式输出当前语言对应的命令说明（中文优先 `COMMANDS_zh.md`，否则回退 `COMMANDS.md`）
 - `/language <zh|en>` 或 `/lang <zh|en>`：在中文和英文之间切换 bot 输出语言
 
@@ -106,6 +107,19 @@
 
 - 查看 OCR 失败记录
 - `-a` / `-all` 表示显示全部
+
+## `/status` 和 `/s`
+
+```text
+/status
+/s
+```
+
+- 以面板形式展示图片索引与 OCR 任务的分类统计
+- 每日任务队列 = 待处理图片 + 仍可重试的失败图片（`ocr_fail_count < OCR_MAX_RETRIES`）
+- 失败记录细分为「可重试」与「已放弃」（达到重试上限，不再重试）
+- 同时显示下载文件夹图片数（对比 `MAX_IMAGES_IN_DOWNLOAD_FOLDER`）、归档文件夹数量与定时任务配置
+- `/s` 是 `/status` 的简写
 
 ## `/help`
 
