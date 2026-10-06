@@ -745,6 +745,8 @@ class ImageSimilaritySearcher:
             'retryable_failed': 0,
             'exhausted_failed': 0,
             'skipped': 0,
+            'missing_link': 0,
+            'searchable': 0,
         }
         with self._db_lock:
             cursor = self.conn.cursor()
@@ -757,11 +759,13 @@ class ImageSimilaritySearcher:
                         SUM(CASE WHEN ocr_status = 'pending' OR (ocr_status = 'failed' AND ocr_fail_count < ?) THEN 1 ELSE 0 END),
                         SUM(CASE WHEN ocr_status = 'failed' THEN 1 ELSE 0 END),
                         SUM(CASE WHEN ocr_status = 'failed' AND ocr_fail_count < ? THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN ocr_status = 'skipped' THEN 1 ELSE 0 END)
+                        SUM(CASE WHEN ocr_status = 'skipped' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN telegram_message_id IS NULL OR telegram_message_id = '' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN ocr_text IS NOT NULL AND ocr_text != '' THEN 1 ELSE 0 END)
                     FROM image_features
                 ''', (max_retries, max_retries))
                 row = cursor.fetchone()
-                total, completed, pending, queue, failed, retryable_failed, skipped = [value or 0 for value in row]
+                total, completed, pending, queue, failed, retryable_failed, skipped, missing_link, searchable = [value or 0 for value in row]
                 return {
                     'total': total,
                     'completed': completed,
@@ -771,6 +775,8 @@ class ImageSimilaritySearcher:
                     'retryable_failed': retryable_failed,
                     'exhausted_failed': failed - retryable_failed,
                     'skipped': skipped,
+                    'missing_link': missing_link,
+                    'searchable': searchable,
                 }
             except Exception as e:
                 self.logger.error(f"Failed to get statistics: {e}")

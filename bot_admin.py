@@ -429,6 +429,8 @@ async def status_command(deps: BotDeps, update: Update, context: ContextTypes.DE
             failed=stats['failed'],
             exhausted_failed=stats['exhausted_failed'],
             skipped=stats['skipped'],
+            missing_link=stats['missing_link'],
+            searchable=stats['searchable'],
             download_count=len(get_image_files_in_folder(deps, IMAGE_DOWNLOAD_PATH)),
             max_download=MAX_IMAGES_IN_DOWNLOAD_FOLDER,
             archive_count=count_archive_folders(IMAGE_DOWNLOAD_PATH),
